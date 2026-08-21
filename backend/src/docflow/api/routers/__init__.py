@@ -1,0 +1,31 @@
+from docflow.api.routers import (
+    agent_evaluations,
+    configurations,
+    document_reviews,
+    documents,
+    drafts,
+    golden_set,
+    jobs,
+    publications,
+    qa_evaluations,
+    retrieval,
+    reviews,
+    system,
+    workflows,
+)
+
+__all__ = [
+    "agent_evaluations",
+    "configurations",
+    "document_reviews",
+    "documents",
+    "drafts",
+    "golden_set",
+    "jobs",
+    "publications",
+    "qa_evaluations",
+    "retrieval",
+    "reviews",
+    "system",
+    "workflows",
+]

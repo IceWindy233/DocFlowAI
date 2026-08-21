@@ -1,0 +1,244 @@
+{
+  "schema_version": "1.0",
+  "set_id": "docflow-agent-public-v1",
+  "name": "DocFlow AI 公开脱敏 Agent 评测集",
+  "description": "全部内容均为虚构演示数据，不对应真实单位、项目或个人。",
+  "synthetic_data": true,
+  "corpus_binding": {
+    "publication_id": null,
+    "index_generation_id": null,
+    "document_count": 5,
+    "binding_policy": "导入 examples/demo-corpus 后按 source_sha256 定位；重新生成文件会改变哈希。"
+  },
+  "selection_policy": {
+    "target_count": 19,
+    "principles": [
+      "覆盖知识问答、公文审核和公文撰写",
+      "事实可由公开虚构语料直接核验",
+      "不包含真实组织、人员、证件、地址或业务数据"
+    ],
+    "distribution": {"qa": 9, "review": 5, "draft": 5}
+  },
+  "qa_samples": [
+    {
+      "id": "PUBLIC-QA-DATE-001",
+      "name": "停车场收费实施日期",
+      "category": "DATE_FACT",
+      "difficulty": "EASY",
+      "question": "示例产业园南区停车场计划从哪一天开始实施对外收费？",
+      "expected": {
+        "behavior": "ANSWER",
+        "reference_answer": "2027年3月1日。",
+        "answer_aliases": ["2027年3月1日", "2027 年 3 月 1 日"],
+        "required_facts": ["2027年3月1日"],
+        "evidence": [{"source_sha256": "e962f75d8c50b74e957c364ad0dfd7281af96d7bb5e0effb36382ff3546c6d50", "file_name": "01-园区停车场运营通知.txt", "title": "关于示例产业园停车场运营安排的通知", "document_number": null, "page_number": 1}]
+      },
+      "coverage": ["public_demo", "native_text", "date"]
+    },
+    {
+      "id": "PUBLIC-QA-BUDGET-001",
+      "name": "停车场三项预算",
+      "category": "MULTI_FACT",
+      "difficulty": "MEDIUM",
+      "question": "停车场升级改造、安保服务和责任保险三项预算分别是多少？",
+      "expected": {
+        "behavior": "ANSWER",
+        "reference_answer": "升级改造预算约8万元，安保服务预算每年7.2万元，责任保险预算每年6000元。",
+        "answer_aliases": ["8万元", "7.2万元", "6000元"],
+        "required_facts": ["8万元", "7.2万元", "6000元"],
+        "evidence": [{"source_sha256": "e962f75d8c50b74e957c364ad0dfd7281af96d7bb5e0effb36382ff3546c6d50", "file_name": "01-园区停车场运营通知.txt", "title": "关于示例产业园停车场运营安排的通知", "document_number": null, "page_number": 1}]
+      },
+      "coverage": ["public_demo", "multi_fact", "numeric"]
+    },
+    {
+      "id": "PUBLIC-QA-ASSET-001",
+      "name": "固定资产盘点总体数据",
+      "category": "MULTI_FACT",
+      "difficulty": "MEDIUM",
+      "question": "示例公司固定资产盘点涉及多少家企业，资产原值、盘亏项数和盘亏原值分别是多少？",
+      "expected": {
+        "behavior": "ANSWER",
+        "reference_answer": "涉及6家模拟企业，资产原值12,500,000元；盘亏12项，原值380,000元。",
+        "answer_aliases": ["6家", "12,500,000元", "12项", "380,000元"],
+        "required_facts": ["6家", "12,500,000元", "12项", "380,000元"],
+        "evidence": [{"source_sha256": "64d45924df8e5e43ef07b865f054aa141bbb7f00576c51cb2b4ca4450f0b148e", "file_name": "02-固定资产盘点说明.txt", "title": "关于示例公司固定资产盘点情况的说明", "document_number": null, "page_number": 1}]
+      },
+      "coverage": ["public_demo", "multi_fact", "numeric"]
+    },
+    {
+      "id": "PUBLIC-QA-ASSET-002",
+      "name": "固定资产单行定位",
+      "category": "ROW_LOOKUP",
+      "difficulty": "MEDIUM",
+      "question": "固定资产编号DEMO-0350001对应的资产名称、存放地点和备注是什么？",
+      "expected": {
+        "behavior": "ANSWER",
+        "reference_answer": "资产名称为装配车间行车（2台），存放地点为示例产业园创新路1号，备注为账实不符、盘亏1台。",
+        "answer_aliases": ["装配车间行车", "创新路1号", "盘亏1台"],
+        "required_facts": ["装配车间行车", "创新路1号", "盘亏1台"],
+        "evidence": [{"source_sha256": "64d45924df8e5e43ef07b865f054aa141bbb7f00576c51cb2b4ca4450f0b148e", "file_name": "02-固定资产盘点说明.txt", "title": "关于示例公司固定资产盘点情况的说明", "document_number": null, "page_number": 1}]
+      },
+      "coverage": ["public_demo", "row_lookup"]
+    },
+    {
+      "id": "PUBLIC-QA-SCOPE-001",
+      "name": "经营范围变更定位",
+      "category": "LIST_FACT",
+      "difficulty": "MEDIUM",
+      "question": "某市示例商务服务有限公司拟新增哪三项经营范围？",
+      "expected": {
+        "behavior": "ANSWER",
+        "reference_answer": "建筑材料销售、五金产品批发、塑料制品销售。",
+        "answer_aliases": ["建筑材料销售", "五金产品批发", "塑料制品销售"],
+        "required_facts": ["建筑材料销售", "五金产品批发", "塑料制品销售"],
+        "evidence": [{"source_sha256": "ee3b22372efb489ff0ce10d93307850544dd2d3eea97fa7a1b697bd31ec51e1b", "file_name": "03-经营范围变更表.txt", "title": "示例公司经营范围变更明细", "document_number": null, "page_number": 1}]
+      },
+      "coverage": ["public_demo", "list_fact"]
+    },
+    {
+      "id": "PUBLIC-QA-LEASE-001",
+      "name": "招租方案汇总数据",
+      "category": "MULTI_FACT",
+      "difficulty": "MEDIUM",
+      "question": "示例产业园商铺的合同总面积、可租赁面积、每月承租总额和预计出租总额分别是多少？",
+      "expected": {
+        "behavior": "ANSWER",
+        "reference_answer": "合同总面积10,000平方米，可租赁面积8,500平方米，每月承租总额220,000元，预计出租总额265,000元。",
+        "answer_aliases": ["10,000平方米", "8,500平方米", "220,000元", "265,000元"],
+        "required_facts": ["10,000平方米", "8,500平方米", "220,000元", "265,000元"],
+        "evidence": [{"source_sha256": "03c6a7f564e15657306c2fef8616fdfff17da9a4e19b18bd88af91522ead7d22", "file_name": "04-园区商铺招租方案.txt", "title": "示例产业园商铺招租方案", "document_number": null, "page_number": 1}]
+      },
+      "coverage": ["public_demo", "multi_fact"]
+    },
+    {
+      "id": "PUBLIC-QA-LEASE-002",
+      "name": "招租方案租赁条件",
+      "category": "CONDITION_SET",
+      "difficulty": "MEDIUM",
+      "question": "示例产业园商户需支付多少押金，租期、免租期和租金递增条件分别是什么？",
+      "expected": {
+        "behavior": "ANSWER",
+        "reference_answer": "支付2个月租赁押金和1个月租金；租期3年；免租期1个月；租金每2年递增5%。",
+        "answer_aliases": ["2个月租赁押金", "1个月租金", "3年", "1个月", "每2年递增5%"],
+        "required_facts": ["2个月租赁押金", "1个月租金", "3年", "免租期1个月", "每2年递增5%"],
+        "evidence": [{"source_sha256": "03c6a7f564e15657306c2fef8616fdfff17da9a4e19b18bd88af91522ead7d22", "file_name": "04-园区商铺招租方案.txt", "title": "示例产业园商铺招租方案", "document_number": null, "page_number": 1}]
+      },
+      "coverage": ["public_demo", "condition_set"]
+    },
+    {
+      "id": "PUBLIC-QA-REPLY-001",
+      "name": "多部门回复汇总",
+      "category": "AGGREGATION",
+      "difficulty": "MEDIUM",
+      "question": "哪些部门对示例产业园招租方案明确表示无意见？",
+      "expected": {
+        "behavior": "ANSWER",
+        "reference_answer": "某市财政部门、某市司法部门和某市规划管理部门。",
+        "answer_aliases": ["财政部门", "司法部门", "规划管理部门"],
+        "required_facts": ["财政部门", "司法部门", "规划管理部门"],
+        "evidence": [{"source_sha256": "c79b71ef03ea723259a4443ca10c2ac94b6d2a951a4094eb0408e90ab0ea95e2", "file_name": "05-部门回复汇总.txt", "title": "关于示例产业园招租方案的回复意见汇总", "document_number": null, "page_number": 1}]
+      },
+      "coverage": ["public_demo", "aggregation"]
+    },
+    {
+      "id": "PUBLIC-QA-ABSTAIN-001",
+      "name": "停车位数量拒答",
+      "category": "UNANSWERABLE",
+      "difficulty": "MEDIUM",
+      "question": "示例产业园南区停车场共有多少个停车位？",
+      "expected": {
+        "behavior": "ABSTAIN",
+        "reference_answer": "现有材料未提供停车位总数，无法确定。",
+        "answer_aliases": ["未提供", "无法确定", "未统计"],
+        "required_facts": [],
+        "forbidden_patterns": ["\\d+个停车位", "共\\d+个"],
+        "evidence": []
+      },
+      "coverage": ["public_demo", "abstention", "hallucination_guard"]
+    }
+  ],
+  "review_samples": [
+    {
+      "id": "PUBLIC-REVIEW-MULTI-001",
+      "name": "日期、测试手机号与口语混合问题",
+      "title": "关于园区设备维修的请示",
+      "text": "某市人民政府：\n请于2027-09-30联系测试负责人13800138000，把这个项目尽快弄好。\n以上请示，妥否，请批示。",
+      "scope": ["STRUCTURE", "FORMAT", "LANGUAGE", "SENSITIVE"],
+      "expected": {"required_categories": ["DATE_FORMAT", "SENSITIVE_INFO", "LANGUAGE"], "minimum_finding_count": 3, "must_be_export_blocked": true},
+      "coverage": ["synthetic_phone", "multi_issue", "auto_fix"]
+    },
+    {
+      "id": "PUBLIC-REVIEW-STRUCTURE-001",
+      "name": "缺少主送单位和结束语",
+      "title": "关于设备采购事项的请示",
+      "text": "为改善办公条件，拟采购一批办公设备，预算费用为5万元，现报请研究。",
+      "scope": ["STRUCTURE"],
+      "expected": {"required_categories": ["STRUCTURE"], "minimum_category_counts": {"STRUCTURE": 2}, "minimum_finding_count": 2},
+      "coverage": ["structure", "missing_addressee", "missing_closing"]
+    },
+    {
+      "id": "PUBLIC-REVIEW-FORMAT-001",
+      "name": "序号格式和附件断号",
+      "title": "关于测试事项的请示",
+      "text": "某市人民政府：\n1. 项目背景。\n2. 实施安排。\n附件1：预算表\n附件3：实施方案\n以上请示，妥否，请批示。",
+      "scope": ["STRUCTURE", "FORMAT"],
+      "expected": {"required_categories": ["SEQUENCE_FORMAT", "ATTACHMENT_SEQUENCE"], "minimum_category_counts": {"SEQUENCE_FORMAT": 2, "ATTACHMENT_SEQUENCE": 1}, "minimum_finding_count": 3},
+      "coverage": ["format", "attachment_sequence", "auto_fix"]
+    },
+    {
+      "id": "PUBLIC-REVIEW-FACT-001",
+      "name": "正文内部金额疑似不一致",
+      "title": "关于园区改造预算的请示",
+      "text": "某市人民政府：\n园区改造预算为5万元，设备预算为6万元，但附件汇总金额列为50万元，请核对。\n以上请示，妥否，请批示。",
+      "scope": ["STRUCTURE", "FACT"],
+      "expected": {"required_categories": ["FACT_CONSISTENCY"], "minimum_finding_count": 1, "expected_original_text": ["50万元"]},
+      "coverage": ["fact_consistency", "numeric_outlier"]
+    },
+    {
+      "id": "PUBLIC-REVIEW-CLEAN-001",
+      "name": "规范短请示对照组",
+      "title": "关于园区设备更新的请示",
+      "text": "某市人民政府：\n为提升园区运营条件，拟实施设备更新，预算费用为5万元，计划于2027年9月30日前完成。\n以上请示，妥否，请批示。",
+      "scope": ["STRUCTURE", "FORMAT", "FACT", "LANGUAGE", "SENSITIVE"],
+      "expected": {"required_categories": [], "maximum_finding_count": 0, "maximum_rule_finding_count": 0, "maximum_major_or_critical_count": 0},
+      "coverage": ["negative_control", "false_positive"]
+    }
+  ],
+  "draft_samples": [
+    {
+      "id": "PUBLIC-DRAFT-LOAN-001",
+      "name": "流动资金贷款请示",
+      "requirements": {"document_type": "REQUEST", "subject": "申请流动资金贷款", "recipient": "某商业银行示例分行", "background": "为保障园区日常运营周转，拟申请流动资金贷款。", "facts": "贷款金额500万元，期限12个月，用于园区运营周转，采用固定资产抵押，还款来源为经营收入。", "requested_action": "申请同意办理流动资金贷款。", "sender": "某市示例产业运营有限公司", "date": "2027年8月16日", "reference_query": "流动资金贷款请示"},
+      "expected": {"should_create": true, "required_facts_in_draft": ["500万元", "12个月", "固定资产抵押", "经营收入"], "preferred_evidence_sha256": [], "verification_should_pass": true},
+      "coverage": ["request", "fact_gate"]
+    },
+    {
+      "id": "PUBLIC-DRAFT-PARKING-001",
+      "name": "停车场升级改造请示",
+      "requirements": {"document_type": "REQUEST", "subject": "园区停车场升级改造", "recipient": "某市人民政府", "background": "为完善园区交通秩序，拟实施停车场升级改造。", "facts": "升级改造预算8万元，计划于2027年3月1日前完成。", "requested_action": "申请同意实施停车场升级改造。", "sender": "某市示例产业运营有限公司", "date": "2027年1月16日", "reference_query": "园区停车场升级改造"},
+      "expected": {"should_create": true, "required_facts_in_draft": ["8万元", "2027年3月1日"], "preferred_evidence_sha256": ["e962f75d8c50b74e957c364ad0dfd7281af96d7bb5e0effb36382ff3546c6d50"], "verification_should_pass": true, "post_edit_probe": {"append_text": "另购无人机设备10台。", "verification_should_pass": false, "expected_unverified_fact": "无人机设备10台"}},
+      "coverage": ["request", "fact_evidence", "hallucination_probe"]
+    },
+    {
+      "id": "PUBLIC-DRAFT-LEASE-001",
+      "name": "园区商铺招租方案请示",
+      "requirements": {"document_type": "REQUEST", "subject": "审议园区商铺招租方案", "recipient": "某市人民政府", "background": "为提高园区资产使用效率，拟开展商铺招租。", "facts": "合同面积10000平方米，可租赁面积8500平方米，预计每月出租总额265000元，租赁期限3年。", "requested_action": "申请审议园区商铺招租方案。", "sender": "某市示例产业运营有限公司", "date": "2027年8月16日", "reference_query": "园区商铺招租方案"},
+      "expected": {"should_create": true, "required_facts_in_draft": ["10000平方米", "8500平方米", "265000元", "3年"], "preferred_evidence_sha256": ["03c6a7f564e15657306c2fef8616fdfff17da9a4e19b18bd88af91522ead7d22"], "verification_should_pass": true},
+      "coverage": ["request", "multi_fact"]
+    },
+    {
+      "id": "PUBLIC-DRAFT-LETTER-001",
+      "name": "协助核对停车场车辆信息函",
+      "requirements": {"document_type": "LETTER", "subject": "协助核对停车场车辆信息", "recipient": "某市综合管理部门", "background": "园区停车场将实施对外收费，需规范车辆分类管理。", "facts": "停车场计划于2027年3月1日实施对外收费。", "requested_action": "请协助核对并更新内部车辆信息。", "sender": "某市示例产业运营有限公司", "date": "2027年2月1日", "reference_query": "停车场对外收费车辆信息"},
+      "expected": {"should_create": true, "required_facts_in_draft": ["2027年3月1日", "核对", "车辆信息"], "preferred_evidence_sha256": ["e962f75d8c50b74e957c364ad0dfd7281af96d7bb5e0effb36382ff3546c6d50"], "verification_should_pass": true},
+      "coverage": ["letter", "date_fact"]
+    },
+    {
+      "id": "DRAFT-GATE-001",
+      "name": "缺少关键信息的需求门禁",
+      "requirements": {"document_type": "REQUEST", "subject": "园区设备更新", "recipient": "", "background": "拟开展园区设备更新。", "facts": "", "requested_action": "", "sender": "", "date": "", "reference_query": "园区设备更新"},
+      "expected": {"should_create": false, "expected_status": "NEEDS_REQUIREMENTS", "required_missing_fields": ["主送单位", "关键事实", "请示事项", "发文单位"]},
+      "coverage": ["requirement_gate", "negative_control", "no_cloud_required"]
+    }
+  ]
+}
