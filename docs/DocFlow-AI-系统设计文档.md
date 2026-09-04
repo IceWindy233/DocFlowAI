@@ -15,7 +15,7 @@
 
 > v0.4 已实现 M2 问答 MVP：使用 LangGraph 编排问题理解、混合召回、证据判断、答案生成和引用校验；使用 LangChain `Document` 作为证据边界，并持久化每次运行的节点轨迹。
 
-> v0.5 固定云模型分工：文本稠密向量采用百炼 `qwen3.7-text-embedding` 2560 维，RAG 生成采用 DeepSeek 官方 `deepseek-v4-flash`；BM25、ColPali、Qdrant 和引用校验继续本地运行。
+> v0.5 固定云模型分工：文本稠密向量采用百炼 `qwen3.7-text-embedding` 2560 维，RAG、审核与撰写生成通过通用 OpenAI 兼容适配器调用配置中心指定的对话模型（出厂默认示例为硅基流动 `deepseek-ai/DeepSeek-V4-Flash`）；BM25、ColPali、Qdrant 和引用校验继续本地运行。
 
 ---
 

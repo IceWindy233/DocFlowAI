@@ -20,9 +20,9 @@
 | --- | --- | --- |
 | M0 数据治理 | 已完成 | 2,570 个文件全量盘点、SHA-256 去重、格式识别、终态统计 |
 | M1 解析入库 | 已完成 | 多格式解析、OCR/VLM 路由、复杂表格、ColPali、文本/视觉索引、Publication |
-| M2 知识问答 | MVP 已完成 | 混合检索、证据充分性判断、DeepSeek/本地抽取、页级引用校验 |
+| M2 知识问答 | MVP 已完成 | 混合检索、证据充分性判断、对话模型/本地抽取、页级引用校验 |
 | M3 公文审核 | MVP 已完成 | 规则审核、语义审核、参考证据、意见合并、人工接受/驳回、DOCX 报告 |
-| M4 公文撰写 | MVP 已完成 | 需求门禁、案例检索、提纲确认、初稿生成、事实核验、版本历史、DOCX 导出 |
+| M4 公文撰写 | MVP 已完成 | 对话式需求理解、案例检索、文种自适应结构、初稿与事实核验、版本历史、DOCX 导出 |
 
 ## 系统架构
 
@@ -46,7 +46,7 @@ flowchart LR
     WF --> RET["混合检索<br/>词法 + 文本向量 + 视觉向量"]
     RET --> PG
     RET --> QD
-    WF --> CLOUD["可选云模型<br/>百炼 Embedding / Reranker / VLM<br/>DeepSeek 生成"]
+    WF --> CLOUD["可选云模型<br/>百炼 Embedding / Reranker / VLM<br/>OpenAI 兼容对话模型"]
 ~~~
 
 完整的离线入库、在线检索、Agent 状态图和配置发布关系见
@@ -62,7 +62,7 @@ flowchart LR
 | 元数据与向量 | PostgreSQL 17、Qdrant |
 | 文档解析 | LibreOffice、Docling、pdfplumber、python-docx、openpyxl |
 | OCR 与视觉 | RapidOCR / PP-OCRv6、Tesseract、ColQwen2.5 / ColPali |
-| 云模型适配 | 百炼、DeepSeek OpenAI-compatible API |
+| 云模型适配 | 百炼 OpenAI 兼容、通用 OpenAI 兼容 API |
 | 工程化 | uv、pnpm、Docker Compose、Pytest、Ruff、ESLint |
 
 ## 快速启动
@@ -140,7 +140,7 @@ uv sync --extra dev --extra ml
 
 默认配置关闭云模型，本地解析、词法检索、规则审核和需求门禁仍可运行。需要完整链路时：
 
-1. 在根目录 <code>.env</code> 设置 <code>DASHSCOPE_API_KEY</code> 和 <code>DEEPSEEK_API_KEY</code>；
+1. 在根目录 <code>.env</code> 设置 <code>DASHSCOPE_API_KEY</code> 和 <code>CHAT_LLM_API_KEY</code>；
 2. 重启后端与 Worker；
 3. 在“配置中心 → 模型档案”填写百炼 Workspace ID，并执行模型探测；
 4. 配置模型输入/输出单价；保持 0 时系统显示“单价未配置”，不会误报为免费；
@@ -152,9 +152,13 @@ uv sync --extra dev --extra ml
 | --- | --- | --- |
 | 文本 Embedding | 百炼 <code>qwen3.7-text-embedding</code>，2560 维 | 可选；启用后需重建文本索引 |
 | Reranker | 百炼 <code>qwen3-rerank</code> | 可选；失败自动保留 RRF 排序 |
-| RAG/审核/撰写生成 | DeepSeek <code>deepseek-v4-flash</code> | 完整 Agent 链路需要 |
+| RAG/审核/撰写生成 | 通用 OpenAI 兼容对话模型（出厂默认示例：硅基流动 <code>deepseek-ai/DeepSeek-V4-Flash</code>） | 完整 Agent 链路需要 |
 | 复杂页面增强 | 百炼 VLM | 可选；本地视觉索引不依赖它 |
 | 视觉检索 | 本地 ColQwen2.5 / ColPali | 复杂页面检索需要 |
+
+内容生成模型通过通用 `openai_compatible` 适配器接入；配置中心“云端对话模型（OpenAI 兼容）”档案统一描述
+Base URL、模型名、密钥变量 `CHAT_LLM_API_KEY` 及安全的标量扩展参数，因此切换其他 OpenAI 兼容服务只需
+修改档案内容，无需改动模型网关，也无需改动密钥变量名。
 
 详细说明见 [云模型接入说明](docs/云模型接入说明.md)。
 
@@ -170,7 +174,7 @@ uv sync --extra dev --extra ml
 8. **体验三类 Agent**：
    - 知识问答：查看混合召回、答案、页码引用和节点轨迹；
    - 公文审核：查看规则/模型意见、证据和自动修改；
-   - 公文撰写：填写需求、确认提纲、生成初稿并执行事实复验。
+   - 公文撰写：用对话描述事项，确认内容顺序，生成初稿并执行事实复验。简单事项使用连续正文，多子项或分阶段事项才显式分节。
 9. **运行固定评测**：先跑公开样例的本地基线，再按需选择少量样例运行完整云模型链路。
 
 ## 评测与验证
@@ -185,7 +189,7 @@ uv sync --extra dev --extra ml
 用于说明系统经过的链路验证，不构成公开数据集。克隆后请使用 `examples/demo-corpus` 建立自己的
 Publication，运行结果取决于本机环境、模型配置和索引代际。
 
-最近一次本地工程回归包含 106 条后端测试，前端通过 TypeScript 生产构建。执行完整验证：
+最近一次本地工程回归包含 118 条后端测试，前端通过 TypeScript 生产构建。执行完整验证：
 
 ~~~bash
 make test
@@ -278,5 +282,6 @@ DocFlowAI/
 - [系统设计文档](docs/DocFlow-AI-系统设计文档.md)
 - [文档解析与知识入库详细设计](docs/文档解析与知识入库详细设计.md)
 - [云模型接入说明](docs/云模型接入说明.md)
+- [公文文体基线说明](docs/公文文体基线说明.md)
 - [Agent 固定评测说明](evaluation/README.md)
 - [安全与数据披露说明](SECURITY.md)

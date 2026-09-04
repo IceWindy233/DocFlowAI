@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections import Counter
@@ -25,17 +26,30 @@ from docflow.db.models import (
     utcnow,
 )
 from docflow.domain.agents import DocumentReviewCreate
-from docflow.domain.config import RuntimeConfigBundleV1
+from docflow.domain.config import (
+    GenreStyleBaseline,
+    RuntimeConfigBundleV1,
+    StyleMetric,
+    WritingStyleConfig,
+)
 from docflow.domain.retrieval import RetrievalSearchRequest
 from docflow.services.config_service import get_current_config
 from docflow.services.model_gateway import CloudModelError, generate_structured_content
 from docflow.services.retrieval import search
 from docflow.services.storage import LocalArtifactStore
+from docflow.services.style_metrics import measure_style
 
 SEVERITY_ORDER = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2, "SUGGESTION": 3}
 PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 ID_PATTERN = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")
 DATE_BAD_PATTERN = re.compile(r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}")
+# 发文字号只认年份括号，机关代字与序号各单位不同，不做校验。
+DOCUMENT_NUMBER_PATTERN = re.compile(r"[〔\[]\d{4}[〕\]]")
+# 成文日期占落款行末尾，允许阿拉伯数字与汉字数字两种写法；正文里的时限日期不在行末。
+SIGNATURE_DATE_PATTERN = re.compile(
+    r"(?m)^.{0,40}(?:\d{4}年\d{1,2}月\d{1,2}日|[〇零一二三四五六七八九十]{2,4}年"
+    r"[〇零一二三四五六七八九十]{1,3}月[〇零一二三四五六七八九十]{1,3}日)\s*$"
+)
 NUMBER_WITH_UNIT = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:亿元|万元|元|平方米|年|个月|%)")
 REFERENCE_JUSTIFICATION_PATTERN = re.compile(
     r"参考(?:材料|文档|资料|内容)|历史材料|检索材料|证据(?:中|显示|表明)|与参考.{0,12}一致"
@@ -152,9 +166,45 @@ def _finding(
     }
 
 
-def deterministic_review(text: str, title: str, scope: list[str]) -> list[dict[str, Any]]:
+def _infer_document_type(title: str, text: str) -> str | None:
+    """从标题推断文种，用于选择对应的文体基线。"""
+    head = f"{title}\n{text[:200]}"
+    # 先判请示：请示件常带「函报」等字样，反向误判则少。
+    if "请示" in head:
+        return "REQUEST"
+    if "函" in head:
+        return "LETTER"
+    return None
+
+
+def _long_line_threshold(
+    style: WritingStyleConfig, baseline: GenreStyleBaseline | None
+) -> tuple[int, str]:
+    """长行阈值取同文种语料 p75：真实公文行长离散度大，阈值必须随文种走。"""
+    metric = baseline.metrics.get(StyleMetric.MAX_LINE_LENGTH) if baseline else None
+    if metric is not None:
+        threshold = math.ceil(metric.p75)
+        return threshold, f"同文种语料 p75（{threshold} 字）"
+    return style.long_line_fallback, f"默认阈值 {style.long_line_fallback} 字"
+
+
+def deterministic_review(
+    text: str,
+    title: str,
+    scope: list[str],
+    style: WritingStyleConfig | None = None,
+    document_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """确定性规则审核。文体类阈值来自 `style` 与该文种基线，缺省时用默认文体配置。"""
+    style = style or WritingStyleConfig()
+    document_type = document_type or _infer_document_type(title, text)
+    baseline = style.baselines.get(document_type) if document_type else None
     findings: list[dict[str, Any]] = []
     lines = [value.strip() for value in text.splitlines() if value.strip()]
+    # 标点、元评论与避坑词共用一次度量，规则只读结果。
+    measurement = measure_style(
+        text, bad_phrases=style.bad_phrases, meta_comment_words=style.meta_comment_words
+    )
     if "STRUCTURE" in scope:
         if not title.strip() or title == "待审核公文":
             findings.append(
@@ -234,6 +284,73 @@ def deterministic_review(text: str, title: str, scope: list[str]) -> list[dict[s
                     confidence=1.0,
                 )
             )
+        dashes = int(measurement.metrics[StyleMetric.DASHES])
+        if dashes > style.max_dashes:
+            findings.append(
+                _finding(
+                    text,
+                    severity="MINOR",
+                    category="FORMAT",
+                    original="——",
+                    suggestion="需停顿用逗号，需转折用句号断开",
+                    reason=f"破折号共 {dashes} 处，超过标点上限 {style.max_dashes} 处",
+                    confidence=0.9,
+                )
+            )
+        colons = measurement.non_quote_colons
+        if colons:
+            findings.append(
+                _finding(
+                    text,
+                    severity="MINOR",
+                    category="FORMAT",
+                    original=colons[0],
+                    suggestion="冒号只用于引语引入、主送机关和层次标题",
+                    reason=f"共 {len(colons)} 处冒号不在这三种位置，属标点误用",
+                    confidence=0.85,
+                )
+            )
+        if measurement.ascii_quotes:
+            findings.append(
+                _finding(
+                    text,
+                    severity="MINOR",
+                    category="FORMAT",
+                    original='"',
+                    suggestion="改用中文弯引号",
+                    reason=f"出现 {measurement.ascii_quotes} 个英文直引号，标点应用中文弯引号",
+                    confidence=0.9,
+                )
+            )
+        # 版式要素成组出现：文头有文号或落款有成文日期，才说明这份稿子按版式排过；
+        # 只排一半才是要素残缺，未排版的正文稿不在此列。
+        head_number = DOCUMENT_NUMBER_PATTERN.search(text[:300])
+        signature_date = SIGNATURE_DATE_PATTERN.search(text[-400:])
+        if document_type and (head_number or signature_date):
+            if not head_number:
+                findings.append(
+                    _finding(
+                        text,
+                        severity="MINOR",
+                        category="STRUCTURE",
+                        original="",
+                        suggestion="补充规范发文字号",
+                        reason="公文版式要素缺失：文头未见规范发文字号",
+                        confidence=0.7,
+                    )
+                )
+            if not signature_date:
+                findings.append(
+                    _finding(
+                        text,
+                        severity="MINOR",
+                        category="STRUCTURE",
+                        original="",
+                        suggestion="在落款处补充中文成文日期",
+                        reason="落款要素缺失：未见中文成文日期",
+                        confidence=0.7,
+                    )
+                )
     if "FACT" in scope:
         normalized_values: dict[str, list[str]] = {}
         for value in NUMBER_WITH_UNIT.findall(text):
@@ -278,8 +395,9 @@ def deterministic_review(text: str, title: str, scope: list[str]) -> list[dict[s
                     )
                 )
     if "LANGUAGE" in scope:
+        threshold, threshold_label = _long_line_threshold(style, baseline)
         for line in lines:
-            if len(line) > 180:
+            if len(line) > threshold:
                 findings.append(
                     _finding(
                         text,
@@ -287,7 +405,7 @@ def deterministic_review(text: str, title: str, scope: list[str]) -> list[dict[s
                         category="LANGUAGE",
                         original=line[:220],
                         suggestion="拆分长句并突出结论或请示事项",
-                        reason=f"该句约 {len(line)} 字，影响阅读",
+                        reason=f"该行约 {len(line)} 字，超过{threshold_label}，长句表述不利于阅读",
                         confidence=0.8,
                     )
                 )
@@ -305,6 +423,30 @@ def deterministic_review(text: str, title: str, scope: list[str]) -> list[dict[s
                         auto_fixable=True,
                     )
                 )
+        for word in measurement.meta_comments:
+            findings.append(
+                _finding(
+                    text,
+                    severity="MINOR",
+                    category="LANGUAGE",
+                    original=word,
+                    suggestion="直接陈述事实、判断和办理请求",
+                    reason="公文不作元评论，此类用语应改为直接陈述",
+                    confidence=0.9,
+                )
+            )
+        for phrase, replacement in measurement.bad_phrases:
+            findings.append(
+                _finding(
+                    text,
+                    severity="SUGGESTION",
+                    category="LANGUAGE",
+                    original=phrase,
+                    suggestion=replacement,
+                    reason="该表述缺乏可执行的主体或时限",
+                    confidence=0.6,
+                )
+            )
     return findings
 
 
@@ -742,7 +884,7 @@ def create_review(db: Session, payload: DocumentReviewCreate) -> dict[str, Any]:
         "review_intake": "审核输入",
         "deterministic_checks": "确定性规则检查",
         "retrieve_references": "参考材料检索",
-        "semantic_review": "DeepSeek 语义审核",
+        "semantic_review": "语义审核",
         "merge_findings": "意见合并去重",
     }
 
@@ -811,7 +953,12 @@ def create_review(db: Session, payload: DocumentReviewCreate) -> dict[str, Any]:
 
     def deterministic_checks(state: ReviewAgentState) -> ReviewAgentState:
         return {
-            "deterministic": deterministic_review(state["text"], state["title"], state["scope"])
+            "deterministic": deterministic_review(
+                state["text"],
+                state["title"],
+                state["scope"],
+                style=config.writing_style,
+            )
         }
 
     def retrieve_references(state: ReviewAgentState) -> ReviewAgentState:

@@ -6,10 +6,12 @@ import pytest
 from sqlalchemy.orm import Session
 
 from docflow.domain.config import (
+    AdapterType,
     ChangeImpact,
     ModelProfileV1,
     RuntimeConfigBundleV1,
     dashscope_workspace_base_url,
+    default_runtime_config,
 )
 from docflow.domain.jobs import IngestionJobCreate
 from docflow.services.config_service import (
@@ -143,22 +145,45 @@ def test_secret_status_never_returns_value(db: Session, monkeypatch: pytest.Monk
     assert "super-secret-value" not in str(status)
 
 
-def test_default_config_has_separate_bailian_embedding_and_deepseek_chat_routes(
+def test_default_config_separates_bailian_embedding_and_generic_chat_routes(
     db: Session,
 ) -> None:
     config = config_from(ensure_default_config(db))
     embedding = next(item for item in config.models if item.profile_id == "bailian_embedding")
-    generation = next(item for item in config.models if item.profile_id == "deepseek_v4_flash")
+    generation = next(item for item in config.models if item.profile_id == "cloud_chat_llm")
 
     assert embedding.provider_id == "dashscope"
     assert embedding.embedding_dimension == 2560
-    assert generation.provider_id == "deepseek"
-    assert generation.model_name == "deepseek-v4-flash"
-    assert generation.base_url == "https://api.deepseek.com"
+    assert generation.adapter_type == AdapterType.OPENAI_COMPATIBLE
+    assert generation.secret_env_name == "CHAT_LLM_API_KEY"
+    assert generation.request_options == {"enable_thinking": False}
     assert config.routing.text_embedding_primary is None
     assert config.routing.qa_generation_primary is None
     assert "DASHSCOPE_API_KEY" in config.security.allowed_secret_env_names
-    assert "DEEPSEEK_API_KEY" in config.security.allowed_secret_env_names
+    assert "CHAT_LLM_API_KEY" in config.security.allowed_secret_env_names
+
+
+def test_adapter_types_expose_no_vendor_specific_chat_protocol() -> None:
+    assert {item.value for item in AdapterType} == {
+        "dashscope_openai",
+        "openai_compatible",
+        "local_transformers",
+        "rapidocr",
+        "tesseract",
+        "docling",
+        "libreoffice",
+    }
+
+
+def test_openai_compatible_request_options_cannot_override_core_payload() -> None:
+    profile = next(
+        item for item in default_runtime_config().models if item.profile_id == "cloud_chat_llm"
+    )
+    payload = profile.model_dump(mode="python")
+    payload["request_options"] = {"model": "unexpected-model"}
+
+    with pytest.raises(ValueError, match="不能覆盖受保护字段"):
+        ModelProfileV1.model_validate(payload)
 
 
 def test_bailian_workspace_id_is_the_endpoint_source_of_truth(db: Session) -> None:
@@ -216,19 +241,19 @@ def test_cloud_routes_require_environment_and_successful_probe(
     db: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("CHAT_LLM_API_KEY", raising=False)
     current = ensure_default_config(db)
     config = config_from(current)
-    deepseek = next(item for item in config.models if item.profile_id == "deepseek_v4_flash")
-    deepseek.enabled = True
-    config.routing.qa_generation_primary = deepseek.profile_id
+    generation = next(item for item in config.models if item.profile_id == "cloud_chat_llm")
+    generation.enabled = True
+    config.routing.qa_generation_primary = generation.profile_id
 
-    with pytest.raises(ModelNotReadyError, match="DEEPSEEK_API_KEY 未配置"):
+    with pytest.raises(ModelNotReadyError, match="CHAT_LLM_API_KEY 未配置"):
         save_config(
             db,
             base_version_id=current.id,
             config=config,
-            change_reason="启用 DeepSeek 问答",
+            change_reason="启用云端对话模型问答",
         )
 
 
@@ -312,21 +337,21 @@ def test_embedding_probe_verifies_real_capability_and_dimension(
     assert ProbeClient.last_payload["dimensions"] == 2560
 
 
-def test_deepseek_probe_uses_official_chat_completion(
+def test_chat_probe_uses_openai_compatible_chat_completion(
     db: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ensure_default_config(db)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("CHAT_LLM_API_KEY", "test-key")
     ProbeClient.response_body = {
         "choices": [{"message": {"content": "OK"}}],
         "usage": {"prompt_tokens": 8, "completion_tokens": 1},
     }
     monkeypatch.setattr("docflow.services.config_service.httpx.Client", ProbeClient)
 
-    result = probe_model(db, "deepseek_v4_flash")
+    result = probe_model(db, "cloud_chat_llm")
 
     assert result.success is True
     assert result.capability_details["capability_verified"] is True
     assert result.capability_details["profile_fingerprint"]
-    assert ProbeClient.last_url == "https://api.deepseek.com/chat/completions"
-    assert ProbeClient.last_payload["thinking"] == {"type": "disabled"}
+    assert ProbeClient.last_url == "https://api.siliconflow.cn/v1/chat/completions"
+    assert ProbeClient.last_payload["enable_thinking"] is False

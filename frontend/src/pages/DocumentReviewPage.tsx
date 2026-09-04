@@ -60,7 +60,7 @@ export function DocumentReviewPage({ userMode = false }: { userMode?: boolean })
 
   const pending = useMemo(() => selected?.findings.filter((item) => item.status === 'PENDING').length ?? 0, [selected])
   return <div className={userMode ? 'user-feature-page user-review-page' : ''}>
-    <PageHeader title={userMode ? '公文审核' : '公文审核 Agent'} description={userMode ? '选择知识库公文或粘贴正文，逐条检查并确认修改建议。' : '规则引擎与 DeepSeek 协同审核；每条意见可定位、解释、反馈并生成修订稿。'} />
+    <PageHeader title={userMode ? '公文审核' : '公文审核 Agent'} description={userMode ? '选择知识库公文或粘贴正文，逐条检查并确认修改建议。' : '规则引擎与对话模型协同审核；每条意见可定位、解释、反馈并生成修订稿。'} />
     {error && <div className="alert danger">{error}</div>}
     <div className="agent-workbench review-workbench">
       <aside className="panel agent-intake">

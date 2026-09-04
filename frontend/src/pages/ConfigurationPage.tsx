@@ -121,7 +121,7 @@ function ModelSettings({ config, selected, select, patch, setConfig, setMessage 
   function addModel() {
     const suffix = Date.now().toString().slice(-6)
     const model: ModelProfile = {
-      profile_id: `custom_${suffix}`, display_name: '新模型档案', provider_id: 'dashscope', adapter_type: 'dashscope_openai', capability: 'VISION_LM', model_name: 'model-name', workspace_id: null, base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', secret_env_name: 'DASHSCOPE_API_KEY', enabled: false, fallback_profile_id: null, temperature: 0.1, max_output_tokens: 4096, timeout_seconds: 120, max_retries: 2, concurrency: 1, requests_per_minute: 30, embedding_dimension: null, model_signature: `custom:model-${suffix}`, price_input_per_million: 0, price_output_per_million: 0,
+      profile_id: `custom_${suffix}`, display_name: '新模型档案', provider_id: 'custom', adapter_type: 'openai_compatible', capability: 'CHAT_LLM', model_name: 'model-name', workspace_id: null, base_url: null, secret_env_name: null, enabled: false, fallback_profile_id: null, temperature: 0.1, max_output_tokens: 4096, timeout_seconds: 120, max_retries: 2, concurrency: 1, requests_per_minute: 30, embedding_dimension: null, model_signature: `custom:model-${suffix}`, price_input_per_million: 0, price_output_per_million: 0, request_options: {},
     }
     setConfig({...config, models: [...config.models, model]}); select(model.profile_id)
   }
@@ -151,6 +151,15 @@ function ModelSettings({ config, selected, select, patch, setConfig, setMessage 
         <div className="form-grid three">
           <Field label="显示名称" value={selected.display_name} onChange={(e) => patch(selected.profile_id, {display_name: e.target.value})} />
           <Field label="供应商 ID" value={selected.provider_id} onChange={(e) => patch(selected.profile_id, {provider_id: e.target.value})} />
+          <SelectField label="协议适配器" value={selected.adapter_type} onChange={(e) => patch(selected.profile_id, {adapter_type: e.target.value})}>
+            <option value="openai_compatible">OpenAI 兼容</option>
+            <option value="dashscope_openai">百炼 OpenAI 兼容</option>
+            <option value="local_transformers">本地 Transformers</option>
+            <option value="rapidocr">RapidOCR</option>
+            <option value="tesseract">Tesseract</option>
+            <option value="docling">Docling</option>
+            <option value="libreoffice">LibreOffice</option>
+          </SelectField>
           <SelectField label="能力" value={selected.capability} onChange={(e) => patch(selected.profile_id, {capability: e.target.value as Capability})}>{['VISION_LM','TEXT_EMBEDDING','VISUAL_RETRIEVAL','OCR','STRUCTURE_PARSER','CHAT_LLM','RERANKER'].map((item) => <option key={item}>{item}</option>)}</SelectField>
           <Field label="模型名称" value={selected.model_name} onChange={(e) => patch(selected.profile_id, {model_name: e.target.value})} />
           <Field label="模型签名" value={selected.model_signature} onChange={(e) => patch(selected.profile_id, {model_signature: e.target.value})} />
@@ -163,6 +172,7 @@ function ModelSettings({ config, selected, select, patch, setConfig, setMessage 
           <Field label="每分钟请求" type="number" value={selected.requests_per_minute} onChange={(e) => patch(selected.profile_id, {requests_per_minute: Number(e.target.value)})} />
           <Field label="输入单价（元/百万 Token）" type="number" min="0" step="0.001" value={selected.price_input_per_million} onChange={(e) => patch(selected.profile_id, {price_input_per_million: Number(e.target.value)})} hint="用于费用估算，未配置请保持 0" />
           <Field label="输出单价（元/百万 Token）" type="number" min="0" step="0.001" value={selected.price_output_per_million} onChange={(e) => patch(selected.profile_id, {price_output_per_million: Number(e.target.value)})} hint="生成模型需同时配置输入、输出单价" />
+          {selected.adapter_type === 'openai_compatible' && <RequestOptionsField profile={selected} patch={patch} setMessage={setMessage} />}
         </div>
         <div className="toggle-list compact"><Toggle label="启用模型" checked={selected.enabled} onChange={(enabled) => patch(selected.profile_id, {enabled})} hint="云模型设为默认路由前必须先探测成功" /></div>
       </div>}
@@ -170,10 +180,38 @@ function ModelSettings({ config, selected, select, patch, setConfig, setMessage 
   </>
 }
 
+function RequestOptionsField({ profile, patch, setMessage }: {
+  profile: ModelProfile
+  patch: (id: string, patch: Partial<ModelProfile>) => void
+  setMessage: (value: {tone: string; text: string} | null) => void
+}) {
+  const serialized = JSON.stringify(profile.request_options ?? {})
+  const [value, setValue] = useState(serialized)
+  useEffect(() => setValue(serialized), [profile.profile_id, serialized])
+
+  function commit() {
+    try {
+      const parsed = JSON.parse(value) as unknown
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('必须是 JSON 对象')
+      const options = parsed as Record<string, unknown>
+      if (Object.values(options).some((item) => !['boolean', 'number', 'string'].includes(typeof item))) {
+        throw new Error('参数值只能是字符串、数字或布尔值')
+      }
+      patch(profile.profile_id, {request_options: options as ModelProfile['request_options']})
+      setMessage(null)
+    } catch (error) {
+      setMessage({tone: 'danger', text: `请求扩展参数无效：${error instanceof Error ? error.message : 'JSON 格式错误'}`})
+      setValue(serialized)
+    }
+  }
+
+  return <Field className="span-two" label="请求扩展参数（JSON）" value={value} onChange={(event) => setValue(event.target.value)} onBlur={commit} hint='仅允许标量扩展参数，例如 {"enable_thinking":false}' />
+}
+
 function RoutingSettings({ config, setSection }: { config: RuntimeConfig; setSection: SectionSetter }) {
   const options = (cap: Capability) => config.models.filter((m) => m.enabled && m.capability === cap)
   const route = (label: string, key: keyof RuntimeConfig['routing'], cap: Capability, optional = false) => <SelectField label={label} value={(config.routing[key] as string | null) ?? ''} onChange={(e) => setSection('routing', {[key]: e.target.value || null})}>{optional && <option value="">不启用</option>}{options(cap).map((m) => <option value={m.profile_id} key={m.profile_id}>{m.display_name}</option>)}</SelectField>
-  return <><div className="section-head"><div><h2>能力路由</h2><p>文本向量和轻量重排序使用百炼，问答生成使用 DeepSeek 官方 API；保存时进行能力与连通性校验。</p></div></div><div className="form-grid">{route('结构解析器','structure_parser','STRUCTURE_PARSER')}{route('首选 OCR','ocr_primary','OCR')}{route('降级 OCR','ocr_fallback','OCR',true)}{route('复杂页面 VLM','vlm_primary','VISION_LM',true)}{route('视觉检索','visual_retrieval_primary','VISUAL_RETRIEVAL',true)}{route('文本向量（百炼）','text_embedding_primary','TEXT_EMBEDDING',true)}{route('轻量重排序（百炼）','reranker_primary','RERANKER',true)}{route('问答生成（DeepSeek）','qa_generation_primary','CHAT_LLM',true)}</div><div className="route-flow"><span>NATIVE</span><b>→</b><span>OCR</span><b>→</b><span>REGION OCR</span><b>→</b><span>VLM</span></div></>
+  return <><div className="section-head"><div><h2>能力路由</h2><p>文本向量和轻量重排序使用百炼，问答、审核与撰写生成使用 OpenAI 兼容对话模型；保存时进行能力与连通性校验。</p></div></div><div className="form-grid">{route('结构解析器','structure_parser','STRUCTURE_PARSER')}{route('首选 OCR','ocr_primary','OCR')}{route('降级 OCR','ocr_fallback','OCR',true)}{route('复杂页面 VLM','vlm_primary','VISION_LM',true)}{route('视觉检索','visual_retrieval_primary','VISUAL_RETRIEVAL',true)}{route('文本向量（百炼）','text_embedding_primary','TEXT_EMBEDDING',true)}{route('轻量重排序（百炼）','reranker_primary','RERANKER',true)}{route('内容生成（OpenAI 兼容）','qa_generation_primary','CHAT_LLM',true)}</div><div className="route-flow"><span>NATIVE</span><b>→</b><span>OCR</span><b>→</b><span>REGION OCR</span><b>→</b><span>VLM</span></div></>
 }
 
 function NumberField({ label, value, onChange, step }: { label: string; value: number; onChange: (value: number) => void; step?: string }) { return <Field label={label} type="number" step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} /> }

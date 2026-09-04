@@ -14,6 +14,7 @@ from docflow.domain.config import RuntimeConfigBundleV1
 from docflow.services.config_service import ensure_default_config
 from docflow.services.draft_agent import (
     _claim_supported_by_requirements,
+    _drafting_brief,
     _enforce_draft_presentation,
     _extract_outline_headings,
     _generate_outline,
@@ -101,7 +102,12 @@ def test_draft_requirement_gate_and_verifier(db: Session) -> None:
         },
         config_version_id=version.id,
         evidence_bundle=[{"id": 1}],
-        draft_text="预算费用为5万元，计划于2026年1月12日实施。[1]",
+        draft_text=(
+            "关于停车场升级改造的请示\n\n"
+            "镇人民政府：\n\n"
+            "预算费用为5万元，计划于2026年1月12日实施。[1]\n\n"
+            "某市示例产业运营有限公司\n2026年1月12日"
+        ),
     )
     assert verify_draft_content(task)["passed"] is True
     task.draft_text = "预算待定。[9]"
@@ -185,6 +191,65 @@ def test_complex_multi_item_request_forces_sectioned_presentation() -> None:
         "实施计划",
         "请示事项",
     ]
+
+
+def test_simple_single_matter_request_stays_paragraph_even_if_model_proposes_sections() -> None:
+    requirements = DraftRequirements(
+        document_type="REQUEST",
+        subject="消防设施升级改造",
+        recipient="镇政府",
+        background="现有消防报警设备老化，部分区域无法实现集中监控。",
+        facts="更换控制器、增设烟感设备并完善联动系统；预算48万元；工期60天。",
+        requested_action="申请同意实施改造并按程序采购。",
+        sender="测试单位",
+    )
+    assert _resolve_presentation_mode(requirements, "SECTIONED") == "PARAGRAPH"
+
+
+def test_drafting_brief_uses_genre_specific_order_and_closing() -> None:
+    request = DraftRequirements(
+        document_type="REQUEST",
+        subject="申请流动资金贷款",
+        recipient="某银行",
+        background="为保障园区运营周转。",
+        facts="贷款500万元，期限12个月。",
+        requested_action="申请同意办理流动资金贷款。",
+        sender="测试单位",
+    )
+    brief = _drafting_brief(
+        request,
+        [{"id": "request", "title": "请示事项", "render_heading": False}],
+    )
+    assert brief["presentation_mode"] == "PARAGRAPH"
+    assert brief["content_order"][-1] == "明确请示事项"
+    assert brief["closing"] == "妥否，请批示。"
+    assert len(brief["style_guide"]) >= 5
+    assert any("力度词" in rule for rule in brief["style_guide"])
+    assert any("文种" in rule for rule in brief["silent_self_check"])
+
+    reply = request.model_copy(
+        update={
+            "document_type": "LETTER",
+            "subject": "回复征求意见函",
+            "background": "《征求意见函》收悉。",
+            "requested_action": "现就有关意见予以函复。",
+        }
+    )
+    reply_brief = _drafting_brief(reply, [])
+    assert reply_brief["genre"] == "复函"
+    assert reply_brief["content_order"][1] == "先明确答复结论"
+    assert reply_brief["closing"] == "特此函复。"
+
+    request_for_feedback = request.model_copy(
+        update={
+            "document_type": "LETTER",
+            "subject": "征求项目方案意见",
+            "requested_action": "请于五个工作日内反馈意见并予以复函。",
+        }
+    )
+    feedback_brief = _drafting_brief(request_for_feedback, [])
+    assert feedback_brief["genre"] == "函"
+    assert feedback_brief["closing"] == "专此函达，请予复函。"
 
 
 def test_draft_presentation_guard_removes_headings_and_unrequested_attachments() -> None:
@@ -429,6 +494,82 @@ def test_failed_generated_draft_is_repaired_once(db: Session, monkeypatch) -> No
         "draft_repairer",
         "repair_verifier",
     ]
+
+
+def test_conversation_edit_updates_requirements_and_recipient_line(
+    db: Session, monkeypatch
+) -> None:
+    version = ensure_default_config(db)
+    task = DraftTask(
+        document_type="REQUEST",
+        title="消防设施升级改造",
+        status="DRAFT_GENERATED",
+        requirements={
+            "document_type": "REQUEST",
+            "subject": "消防设施升级改造",
+            "recipient": "某市人民政府",
+            "background": "消防报警设备老化。",
+            "facts": "更换火灾报警控制器并增设烟感设备。",
+            "requested_action": "申请同意实施改造。",
+            "sender": "某市示例资产经营有限公司",
+            "date": "2026年8月18日",
+            "reference_query": "",
+        },
+        outline=[{"id": "facts", "title": "有关情况", "render_heading": False}],
+        evidence_bundle=[],
+        config_version_id=version.id,
+        draft_text=(
+            "关于实施消防设施升级改造的请示\n\n某市人民政府：\n\n"
+            "消防报警设备老化，拟更换火灾报警控制器并增设烟感设备。"
+            "申请同意实施改造。\n\n妥否，请批示。\n\n"
+            "某市示例资产经营有限公司\n2026年8月18日"
+        ),
+        verification={"passed": True},
+        cloud_usage={},
+    )
+    db.add(task)
+    db.commit()
+
+    monkeypatch.setattr(
+        "docflow.services.draft_agent.interpret_requirement_patch",
+        lambda *_args, **_kwargs: {
+            "requirements_patch": {"recipient": "示例镇人民政府"},
+            "cloud_usage": {"calls": 1, "input_tokens": 10, "output_tokens": 5},
+            "warning": None,
+        },
+    )
+
+    def fake_generation(*_args, purpose: str, **_kwargs):
+        if purpose == "公文初稿生成":
+            return StructuredGenerationResult(
+                content={"draft_text": task.draft_text, "unverified_facts": []},
+                model_signature="fake:draft",
+                usage={"calls": 1, "input_tokens": 20, "output_tokens": 20},
+            )
+        assert purpose == "公文事实核验"
+        return StructuredGenerationResult(
+            content={"unsupported_claims": []},
+            model_signature="fake:verify",
+            usage={"calls": 1, "input_tokens": 10, "output_tokens": 5},
+        )
+
+    monkeypatch.setattr("docflow.services.draft_agent.generate_structured_content", fake_generation)
+
+    result = generate_draft(
+        db,
+        task.id,
+        mode="PRESERVE_MANUAL",
+        instruction="主送单位是示例镇人民政府，我是要修改这个",
+    )
+
+    assert result["requirements"]["recipient"] == "示例镇人民政府"
+    assert "示例镇人民政府：" in result["draft_text"]
+    assert "某市人民政府：" not in result["draft_text"]
+    assert result["verification"]["passed"] is True
+    run = db.get(WorkflowRun, result["workflow_run_id"])
+    assert run is not None
+    assert run.input_json["requirements_patch"] == {"recipient": "示例镇人民政府"}
+    assert run.trace_json[0]["node"] == "requirement_editor"
 
 
 def test_agent_tables_are_available(db: Session) -> None:

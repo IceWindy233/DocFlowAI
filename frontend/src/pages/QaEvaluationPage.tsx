@@ -118,7 +118,7 @@ export function QaEvaluationPage() {
 
   async function run(mode: AgentEvaluationMode) {
     const cloudMode = mode.startsWith('FULL_')
-    if (cloudMode && !window.confirm(`将运行 ${selected[capability].length} 条${meta.label}完整评测，可能调用百炼和 DeepSeek 并生成真实工作流记录。确认继续？`)) return
+    if (cloudMode && !window.confirm(`将运行 ${selected[capability].length} 条${meta.label}完整评测，可能调用百炼和云端对话模型并生成真实工作流记录。确认继续？`)) return
     setWorking(mode); setMessage('')
     try {
       const result = await postJson<AgentEvaluationRun>('/agent-evaluations/runs', {

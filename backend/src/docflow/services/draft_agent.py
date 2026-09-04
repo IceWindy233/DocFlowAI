@@ -16,12 +16,14 @@ from sqlalchemy.orm import Session
 
 from docflow.db.models import ConfigVersion, DraftRevision, DraftTask, Page, WorkflowRun, utcnow
 from docflow.domain.agents import DraftRequirements
-from docflow.domain.config import RuntimeConfigBundleV1
+from docflow.domain.config import RuntimeConfigBundleV1, WritingStyleConfig
 from docflow.domain.retrieval import RetrievalSearchRequest
 from docflow.services.config_service import get_current_config
+from docflow.services.draft_conversation import interpret_requirement_patch
 from docflow.services.model_gateway import CloudModelError, generate_structured_content
 from docflow.services.retrieval import search
 from docflow.services.storage import LocalArtifactStore
+from docflow.services.style_metrics import BLOCKING_PLACEHOLDER_KINDS, style_report
 
 REQUIRED_FIELDS = {
     "REQUEST": {
@@ -51,14 +53,23 @@ HEADING_PREFIX_PATTERN = re.compile(
 CLOSING_SECTION_PATTERN = re.compile(
     r"(?:以上.*(?:妥否|当否)|妥否.*批示|当否.*批示|恳请批复|请予批示|特此(?:请示|函达|函复)|此复)"
 )
+# 复函的表态词。批复类文种表态在最前，理由跟在表态之后。
+STANCE_PATTERN = re.compile(
+    r"原则同意|同意|不同意|予以支持|不予支持|无意见|可行|不宜|已办理|暂不"
+)
 DISPLAY_HEADING_PATTERN = re.compile(
     r"^\s*(?:[一二三四五六七八九十]{1,3}、|（[一二三四五六七八九十]{1,3}）|\d+[、.])\s*[^\n。；]{1,40}\s*$",
     re.MULTILINE,
 )
 COMPLEX_STRUCTURE_PATTERNS = (
-    re.compile(r"包括[一二三四五六七八九十\d]+个?(?:子项|事项|任务|工程|方案)"),
-    re.compile(r"分[一二三四五六七八九十\d]+个?阶段"),
+    re.compile(
+        r"(?:包括|包含|涉及|分为)[一二三四五六七八九十\d]+个?(?:子项|事项|任务|工程|方案|部分)"
+    ),
+    re.compile(r"分[一二三四五六七八九十\d]+个?(?:阶段|批次|步骤)"),
     re.compile(r"一是[\s\S]{0,500}二是"),
+    re.compile(
+        r"(?:^|[\n；;])\s*(?:1|1[.、）)]|一[、是])[^\n]{2,200}(?:\n|[；;])\s*(?:2|2[.、）)]|二[、是])"
+    ),
 )
 
 
@@ -195,9 +206,18 @@ def _normalize_outline(value: Any, document_type: str) -> list[dict[str, str]]:
 
 
 def _requires_sectioned_presentation(requirements: DraftRequirements) -> bool:
-    """判断需求是否明确包含多个独立结构单元。"""
+    """判断是否存在值得显式分层的独立内容单元。
+
+    金额、期限、用途等同一审批事项的属性不单独触发分节；只有子项、
+    分阶段安排、多项独立决策或显著复杂的事实集才分层。
+    """
     content = f"{requirements.background}\n{requirements.facts}\n{requirements.requested_action}"
     if any(pattern.search(content) for pattern in COMPLEX_STRUCTURE_PATTERNS):
+        return True
+    if len(requirements.facts.strip()) >= 600:
+        return True
+    money_items = re.findall(r"\d+(?:\.\d+)?\s*(?:万|亿)?元", requirements.facts)
+    if len(money_items) >= 3 and re.search(r"(?:子项|分别|其中|各项)", requirements.facts):
         return True
     approval_verbs = re.findall(r"(?:同意|审议|批准|批复|核准)", requirements.requested_action)
     approval_parts = [
@@ -206,11 +226,90 @@ def _requires_sectioned_presentation(requirements: DraftRequirements) -> bool:
     return len(approval_verbs) >= 2 and len(approval_parts) >= 2
 
 
-def _resolve_presentation_mode(requirements: DraftRequirements, proposed_mode: str) -> str:
-    """用通用复杂度信号校正模型的呈现判断。"""
+def _resolve_presentation_mode(requirements: DraftRequirements, _proposed_mode: str) -> str:
+    """用可解释的复杂度信号决定呈现方式。"""
+    # 模型只规划内容顺序，不能把简单事项强制变成分节文。
     if _requires_sectioned_presentation(requirements):
         return "SECTIONED"
-    return "PARAGRAPH" if proposed_mode == "PARAGRAPH" else "SECTIONED"
+    return "PARAGRAPH"
+
+
+def _letter_intent(requirements: DraftRequirements) -> str:
+    """区分普通商请函与复函，用于选择文种承启句和结语。"""
+    subject = requirements.subject.strip()
+    context = f"{requirements.background}\n{requirements.requested_action}"
+    if re.match(r"^(?:关于)?(?:回复|答复|函复|复函)", subject) or re.search(
+        r"(?:来函|收悉|现函复|予以函复|答复如下)", context
+    ):
+        return "REPLY"
+    return "COORDINATION"
+
+
+def _drafting_brief(
+    requirements: DraftRequirements,
+    outline: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """把文种与结构决策显式交给生成节点，避免依赖模型猜测。"""
+    paragraph_mode = bool(outline) and all(item.get("render_heading") is False for item in outline)
+    common = {
+        "presentation_mode": "PARAGRAPH" if paragraph_mode else "SECTIONED",
+        "length_rule": "事项说完即止，不为满足模板而扩写",
+        "fact_rule": "只使用 requirements 中已确认事实，不从参考文移植事实",
+        "style_guide": [
+            "篇名直接说明事由和文种，不加叙事钩子、比喻或宣传性前缀",
+            "每句有明确主体和动作；同一逻辑内可适度合并并列成分，但不机械拉长句子",
+            "‘必须’‘应当’‘切实’‘确保’只在事实、制度或职责确有要求时使用，不堆叠力度词",
+            "标点只服务于语法和层次；正文不用破折号制造节奏，不用冒号制造悬念或媒体化揭晓",
+            "不用‘其实是’‘说到底’‘归根到底’等元评论，直接陈述事实、判断和办理请求",
+            "没有提供真实文号、政策依据、领导批示或数据时不引用、不暗示、不补造",
+        ],
+        "placeholder_rule": [
+            "requirements 未提供、但该文种必须出现的文号、日期、金额或单位，写成"
+            "‘【待补：xx】’占位，禁止杜撰，也不要绕开该要素",
+            "为帮助理解而给出的参考量级写成‘【示意·待核】’；引用上级文件表述拿不准时"
+            "写成‘【待核对原文】’",
+            "只用这三种占位写法；未提供的可省实施细节仍应直接省略，不要为它们加占位符",
+        ],
+        "silent_self_check": [
+            "标题、主送机关、行文方向和结语是否匹配文种",
+            "是否完整保留用户确认的金额、日期、期限、单位和办理动作",
+            "是否出现无依据事实、重复表述、空洞表态、口语或不必要分层",
+        ],
+    }
+    if requirements.document_type == "REQUEST":
+        return {
+            **common,
+            "genre": "请示",
+            "title_pattern": "关于+事由+的请示，事由不重复‘关于’或‘的请示’",
+            "content_order": ["缘由或依据", "待审批方案与关键事实", "明确请示事项"],
+            "opening_rule": "直接交代为什么请示，不用‘高度重视’等空洞开场",
+            "stance_rule": "如实陈述并请求上级审定，不预设已获批准，不以命令口吻要求主送机关",
+            "closing": "妥否，请批示。",
+        }
+    if _letter_intent(requirements) == "REPLY":
+        return {
+            **common,
+            "genre": "复函",
+            "title_pattern": "关于+事由+的复函",
+            "content_order": ["交代来函收悉", "先明确答复结论", "必要的理由或安排"],
+            "opening_rule": (
+                "如 requirements 提供来函名称或文号，用‘…收悉。现函复如下’；未提供则不虚构"
+            ),
+            "stance_rule": "答复意见或处理结论置于前部，不先铺陈大段背景后才表态",
+            "closing": "特此函复。",
+        }
+    asks_for_reply = bool(
+        re.search(r"(?:请.*(?:回复|复函|反馈)|请予函复)", requirements.requested_action)
+    )
+    return {
+        **common,
+        "genre": "函",
+        "title_pattern": "关于+事由+的函",
+        "content_order": ["行函缘由", "需要协商或告知的事项", "对受文单位的明确请求"],
+        "opening_rule": "直接交代行函目的，不把函写成请示",
+        "stance_rule": "对不相隶属单位使用商请或告知语气，不使用上下级命令口吻",
+        "closing": "专此函达，请予复函。" if asks_for_reply else "特此函达。",
+    }
 
 
 def _refine_outline_for_presentation(
@@ -277,6 +376,17 @@ def _enforce_draft_presentation(
             "",
             value,
         )
+    lines = value.splitlines()
+    expected_recipient = f"{requirements.recipient.strip()}："
+    if requirements.recipient.strip() and not any(
+        line.strip() == expected_recipient for line in lines
+    ):
+        for index, line in enumerate(lines[:8]):
+            normalized = line.strip()
+            if index > 0 and len(normalized) <= 80 and normalized.endswith(("：", ":")):
+                lines[index] = expected_recipient
+                value = "\n".join(lines)
+                break
     return re.sub(r"\n{3,}", "\n\n", value).strip()
 
 
@@ -439,14 +549,15 @@ def _generate_outline(
         "结构依据的优先级：①reference_structures 中与当前文种和主题最相近的正式公文一级标题；"
         "②requirements 的事项逻辑；③同类公文惯例。若高相关原文已有简洁且完整的骨架，"
         "优先保留其结构粒度和先后关系；不要为了显得完整而强行凑成4至5节。"
-        "短篇、单一请求的请示通常用2至3节即可，背景、必要性和基本情况可合并，"
+        "法定公文没有固定篇幅，事项说完即止。短篇、单一请求的请示应优先使用"
+        "连续自然段；内部提纲通常只保留2至3个内容单元，背景、必要性和基本情况可合并，"
         "方案金额、期限、用途、还款来源和担保方式等同一审批事项的属性应放在同一章节内，"
         "除非参考原文确有独立的一级结构。\n"
         "严格区分正文章节与公文组件：公文标题、主送机关、引言、结束语、附件、落款和日期都不是提纲章节。"
         "‘以上请示，妥否，请批示’、‘恳请批复’、‘特此函复’等只能作为结束语，"
         "绝对不得成为章节。避免‘申请事项’与‘请示事项’、‘有关情况’与‘基本情况’等语义重叠。"
         "请示如果设‘请示事项’，它应是最后一个实质章节。\n"
-        "另外判断正文呈现方式：单一审批事项、事实简洁、没有多个独立方案或数据分析时，"
+        "另外预判正文呈现方式：单一审批或单一商请事项、事实简洁、没有多个独立方案时，"
         "presentation_mode 应为 PARAGRAPH，最终正文使用连续自然段，提纲仅作内部逻辑规划；"
         "只有存在多个独立事项、复杂方案、分阶段安排、大量数据或政策论证时，才使用 SECTIONED。"
         "不得仅因参考文件有序号标题就选择 SECTIONED。\n"
@@ -459,6 +570,7 @@ def _generate_outline(
         "输出 JSON 对象，仅含 presentation_mode 和 outline；"
         "presentation_mode 只能是 PARAGRAPH 或 SECTIONED；outline 每项仅含 id 和 title。"
         "title 使用2至12个字的规范中文标题，不带‘一、’等序号，不写该节正文；"
+        "同一篇的标题应保持相同语法层级，直接概括该部分功能，不使用比喻、口号或媒体化设问。"
         "请示最多5节，函最多4节。只依据 requirements 规划，不补充未知事实。"
     )
     reference_structures = _reference_outline_structures(db, cases)
@@ -495,9 +607,14 @@ def _generate_outline(
             None,
         )
     except CloudModelError as exc:
+        presentation_mode = _resolve_presentation_mode(requirements, "PARAGRAPH")
+        fallback_outline = _refine_outline_for_presentation(
+            _default_outline(requirements.document_type), presentation_mode, requirements
+        )
+        render_heading = presentation_mode == "SECTIONED"
         return (
-            _default_outline(requirements.document_type),
-            "local:outline-template-v1",
+            [{**item, "render_heading": render_heading} for item in fallback_outline],
+            "local:outline-template-v2",
             exc.usage,
             str(exc),
         )
@@ -700,22 +817,20 @@ def update_outline(
 
 
 def _fallback_draft(requirements: DraftRequirements, evidence: list[dict[str, Any]]) -> str:
+    del evidence  # 历史页默认仅是风格参考，降级稿不冒充事实引用。
     title = (
         f"关于{requirements.subject}的{'请示' if requirements.document_type == 'REQUEST' else '函'}"
     )
-    ending = (
-        "以上请示，妥否，请批示。"
-        if requirements.document_type == "REQUEST"
-        else "以上事项，函请贵单位研究支持。"
-    )
-    reference = " [1]" if evidence else ""
+    strategy = _drafting_brief(requirements, [])
+    if requirements.document_type == "LETTER" and strategy["genre"] == "复函":
+        title = f"关于{requirements.subject}的复函"
     parts = [
         title,
         f"{requirements.recipient}：",
-        f"{requirements.background}{reference}",
+        requirements.background,
         requirements.facts,
         requirements.requested_action,
-        ending,
+        str(strategy["closing"]),
         requirements.sender,
         requirements.date,
     ]
@@ -774,6 +889,8 @@ def _semantic_verify_draft(
         "数组）。‘影响正常运营’、‘影响形象’、‘存在重大风险’、‘亟需改造’等对当前"
         "现状、影响或紧迫性的判断也是事实主张，未在 requirements 提供时必须列为无依据。"
         "不要把纯结构、礼貌用语和不含现状判断的一般性目的表述列为事实。"
+        "‘【待补：…】’‘【示意·待核】’‘【待核对原文】’是显式声明的事实缺口标记，"
+        "本身不是事实主张，不列为无依据；但占位符之外被当成既定事实陈述的内容仍要核。"
     )
     try:
         checked = generate_structured_content(
@@ -847,11 +964,38 @@ def generate_draft(
         raise ValueError(f"需求不完整：{'、'.join(task.missing_fields)}")
     if task.status not in {"OUTLINE_APPROVED", "DRAFT_GENERATED", "DRAFT_EDITED", "EXPORTED"}:
         raise ValueError("请先确认提纲后再生成初稿")
-    requirements = DraftRequirements.model_validate(task.requirements)
     pinned_config = db.get(ConfigVersion, task.config_version_id)
     if not pinned_config:
         raise LookupError("撰写任务绑定的配置版本不存在")
     config = RuntimeConfigBundleV1.model_validate(pinned_config.content)
+    requirements = DraftRequirements.model_validate(task.requirements)
+    requirement_edit: dict[str, Any] = {}
+    requirement_edit_usage: dict[str, Any] = {}
+    requirement_edit_warning: str | None = None
+    requirement_edit_duration_ms = 0
+    if task.draft_text and instruction and instruction.strip():
+        requirement_edit_started = time.perf_counter()
+        interpreted = interpret_requirement_patch(
+            config,
+            message=instruction.strip(),
+            current_requirements=requirements.model_dump(),
+        )
+        requirement_edit_duration_ms = round(
+            (time.perf_counter() - requirement_edit_started) * 1000
+        )
+        requirement_edit = dict(interpreted.get("requirements_patch") or {})
+        requirement_edit_usage = dict(interpreted.get("cloud_usage") or {})
+        requirement_edit_warning = interpreted.get("warning")
+        if requirement_edit:
+            merged_requirements = requirements.model_dump()
+            merged_requirements.update(requirement_edit)
+            requirements = DraftRequirements.model_validate(merged_requirements)
+            task.requirements = requirements.model_dump()
+            task.document_type = requirements.document_type
+            task.title = requirements.subject
+            task.missing_fields = _missing(requirements)
+            if task.missing_fields:
+                raise ValueError(f"修改后的需求不完整：{'、'.join(task.missing_fields)}")
     run = WorkflowRun(
         workflow_type="DOCUMENT_DRAFT_GENERATION",
         status="RUNNING",
@@ -861,6 +1005,7 @@ def generate_draft(
             "outline": task.outline,
             "mode": mode,
             "instruction": instruction.strip() if instruction else None,
+            "requirements_patch": requirement_edit,
         },
         state_json={},
         trace_json=[],
@@ -875,7 +1020,9 @@ def generate_draft(
         "事实；历史材料仅用于结构和措辞参考，不得把其中的金额、日期、单位移植为当前事实。"
         "不得自行增加现状判断、改造项目、金额、日期、单位或实施依据，也不得把用户表达的目标"
         "改写成‘目前存在问题’等未经证实的现状结论；未提供的实施细节应直接"
-        "省略，不要为了充实正文而猜测。unverified_facts 只能列出确实写入 draft_text 且没有"
+        "省略，不要为了充实正文而猜测。该文种必须出现而 requirements 未提供的文号、日期、"
+        "金额或单位，按 writing_brief.placeholder_rule 占位，不得杜撰。"
+        "unverified_facts 只能列出确实写入 draft_text 且没有"
         "依据的原文片段，不得把 requirements 已提供的事实列入其中。输出 JSON 对象，字段 "
         "draft_text、"
         "used_evidence_ids、unverified_facts。正文须包含标题、主送单位、按提纲组织的正文、规范结束语、"
@@ -885,7 +1032,14 @@ def generate_draft(
         "同一背景、问题或必要性；短篇请示应简洁，不为增加篇幅而同义反复。"
         "evidence 只包含未获事实授权的结构提示，不得据此增加任何当前事项事实。"
         "只有 requirements 明确提供了附件名称时才可输出附件段；不得因历史公文常带附件"
-        "就虚构‘项目实施方案’、‘预算明细表’等附件。"
+        "就虚构‘项目实施方案’、‘预算明细表’等附件。\n"
+        "必须严格执行 writing_brief：文种标题、内容顺序、承启方式和结语必须匹配。"
+        "简单请示以2至4个连续自然段说清缘由、方案事实和请示事项，不显示‘基本情况’"
+        "‘实施方案’‘请示事项’等模板标题。复函应先给出明确答复再说明理由；"
+        "普通函不得使用‘妥否，请批示’。语句应正式、准确、简洁，不使用‘尽快帮忙安排一下’"
+        "等口语，不以‘高度重视’等空洞表态开场，不用破折号制造节奏。"
+        "生成前按 writing_brief.silent_self_check 在内部检查，不向 draft_text 输出检查过程、"
+        "说明、参数报告或写作建议。"
     )
     regeneration_instruction = "首次生成完整初稿。"
     if task.draft_text and mode == "FULL":
@@ -901,10 +1055,26 @@ def generate_draft(
         )
     if instruction and instruction.strip():
         regeneration_instruction += (
-            " 用户还提出了以下本轮编辑要求，请尽量只修改与要求相关的内容，"
+            " 用户还提出了以下本轮编辑要求。requirements 已合并本轮明确修改，是当前唯一权威"
+            "事实；必须替换 existing_draft 中与新 requirements 冲突的旧值，只修改相关内容并"
             "保留其他已确认事实和正文结构：" + instruction.strip()
         )
     trace: list[dict[str, Any]] = []
+    if instruction and instruction.strip():
+        trace.append(
+            {
+                "sequence": 1,
+                "node": "requirement_editor",
+                "label": "编辑要求理解",
+                "status": "DEGRADED" if requirement_edit_warning else "SUCCEEDED",
+                "duration_ms": requirement_edit_duration_ms,
+                "summary": (
+                    f"更新 {len(requirement_edit)} 个需求字段"
+                    if requirement_edit
+                    else ("需求理解降级" if requirement_edit_warning else "未涉及事实字段")
+                ),
+            }
+        )
     labels = {
         "draft_composer": "公文初稿生成",
         "fact_verifier": "事实与引用校验",
@@ -979,6 +1149,7 @@ def generate_draft(
                     "existing_draft": task.draft_text,
                     "regeneration_instruction": regeneration_instruction,
                     "user_edit_instruction": instruction.strip() if instruction else None,
+                    "writing_brief": _drafting_brief(requirements, task.outline),
                 },
                 purpose="公文初稿生成",
             )
@@ -1020,7 +1191,10 @@ def generate_draft(
         semantic_warning = semantic_warning or state.get("warning")
         return {
             "verification": verify_draft_content(
-                task, _deduplicate_unverified(semantic_unverified), semantic_warning
+                task,
+                _deduplicate_unverified(semantic_unverified),
+                semantic_warning,
+                style=config.writing_style,
             ),
             "verification_usage": semantic_usage,
             "repair_attempted": False,
@@ -1032,7 +1206,10 @@ def generate_draft(
             "事实、无效引用和模型自行增加的现状或实施细节，同时补回 requirements 明确要求但"
             "遗漏的事实。只能使用 requirements 中的事实；evidence 默认仅用于结构措辞。不得"
             "增加新的金额、日期、设备、工程内容、单位、地点或判断，也不得保留仅来自样式参考"
-            "的事实。输出完整 JSON，字段"
+            "的事实。修复后仍须遵守 writing_brief 中的呈现方式、文种顺序和规范结语。"
+            "draft_text 中已有的‘【待补：…】’‘【示意·待核】’‘【待核对原文】’必须原样保留，"
+            "不得替换成具体数值，也不得删掉整句改成回避表述。"
+            "输出完整 JSON，字段"
             "draft_text、unverified_facts；修复后不应仍有无依据事实。"
         )
         try:
@@ -1045,6 +1222,7 @@ def generate_draft(
                     "draft_text": state["draft_text"],
                     "verification": state.get("verification") or {},
                     "evidence": _style_evidence_projection(task.evidence_bundle[:6]),
+                    "writing_brief": _drafting_brief(requirements, task.outline),
                 },
                 purpose="公文初稿约束修复",
             )
@@ -1110,11 +1288,14 @@ def generate_draft(
         task.model_signature = state["model_signature"]
         task.cloud_usage = _usage_add(
             task.cloud_usage or {},
+            requirement_edit_usage,
             state.get("generation_usage") or {},
             state.get("verification_usage") or {},
         )
         run_usage = _usage_add(
-            state.get("generation_usage") or {}, state.get("verification_usage") or {}
+            requirement_edit_usage,
+            state.get("generation_usage") or {},
+            state.get("verification_usage") or {},
         )
         task.verification = {
             **state["verification"],
@@ -1156,8 +1337,30 @@ def generate_draft(
         raise
 
 
+def _body_after_recipient(text: str) -> str:
+    """跳过标题与主送机关行，只保留实质正文，用于表态位置判断。"""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().endswith(("：", ":")):
+            return "\n".join(lines[index + 1 :])
+    return "\n".join(lines[1:]) if len(lines) > 1 else text
+
+
+def _stance_position(text: str) -> dict[str, Any]:
+    """复函先表态后说理：返回表态词在实质正文中的相对位置。"""
+    body = _body_after_recipient(text).strip()
+    match = STANCE_PATTERN.search(body)
+    if not body or not match:
+        return {"found": False, "ratio": None, "leading": False}
+    ratio = round(match.start() / len(body), 2)
+    return {"found": True, "ratio": ratio, "leading": ratio <= 0.5}
+
+
 def verify_draft_content(
-    task: DraftTask, unverified: list[Any] | None = None, warning: str | None = None
+    task: DraftTask,
+    unverified: list[Any] | None = None,
+    warning: str | None = None,
+    style: WritingStyleConfig | None = None,
 ) -> dict[str, Any]:
     requirements = DraftRequirements.model_validate(task.requirements)
     text = task.draft_text
@@ -1169,14 +1372,53 @@ def verify_draft_content(
     inline_ids = {int(value) for value in re.findall(r"\[(?:证据)?(\d+)\]", text)}
     valid_ids = {int(item["id"]) for item in task.evidence_bundle if item.get("id")}
     invalid_ids = sorted(inline_ids - valid_ids)
+    required_field_patterns = (
+        (
+            "主送单位",
+            requirements.recipient,
+            rf"(?m)^\s*{re.escape(requirements.recipient.strip())}\s*[：:]\s*$",
+        ),
+        (
+            "发文单位",
+            requirements.sender,
+            rf"(?m)^\s*{re.escape(requirements.sender.strip())}\s*$",
+        ),
+    )
+    missing_required_fields = [
+        label
+        for label, value, pattern in required_field_patterns
+        if value.strip() and re.search(pattern, text) is None
+    ]
+    style_config = style or WritingStyleConfig()
+    report = style_report(
+        text,
+        style_config.baselines.get(requirements.document_type),
+        bad_phrases=style_config.bad_phrases,
+        meta_comment_words=style_config.meta_comment_words,
+    )
+    if _letter_intent(requirements) == "REPLY":
+        report["stance_position"] = _stance_position(text)
+    placeholders = report.get("placeholders") or {}
+    pending_placeholders = [
+        value for kind in BLOCKING_PLACEHOLDER_KINDS for value in placeholders.get(kind, [])
+    ]
     return {
-        "passed": not missing_facts and not invalid_ids and not (unverified or []),
+        # 文体偏离不进 passed：区间是描述性的，多项同向偏离才说明节奏不对。
+        "passed": (
+            not missing_facts
+            and not invalid_ids
+            and not missing_required_fields
+            and not (unverified or [])
+        ),
         "missing_required_facts": missing_facts,
+        "missing_required_fields": missing_required_fields,
         "invalid_citation_ids": invalid_ids,
         "unverified_facts": unverified or [],
         "warning": warning,
         "fact_count": len(facts),
         "citation_count": len(inline_ids),
+        "pending_placeholders": pending_placeholders,
+        "style_report": report,
     }
 
 
@@ -1206,7 +1448,9 @@ def update_draft_text(db: Session, draft_id: str, text: str) -> dict[str, Any]:
         config, requirements, text, task.evidence_bundle
     )
     task.draft_text = text
-    task.verification = verify_draft_content(task, unsupported, warning)
+    task.verification = verify_draft_content(
+        task, unsupported, warning, style=config.writing_style
+    )
     task.status = "DRAFT_EDITED"
     task.export_path = None
     task.finished_at = None
@@ -1345,14 +1589,29 @@ def _normalized_task_evidence(task: DraftTask) -> list[dict[str, Any]]:
     return values[:8]
 
 
+def _placeholder_gate_enabled(db: Session, task: DraftTask) -> bool:
+    """占位符门禁读任务绑定的配置版本，保证历史任务按当时口径导出。"""
+    pinned = db.get(ConfigVersion, task.config_version_id)
+    if not pinned:
+        return True
+    config = RuntimeConfigBundleV1.model_validate(pinned.content)
+    return config.writing_style.placeholder_export_gate
+
+
 def export_draft(db: Session, draft_id: str) -> str:
     task = db.get(DraftTask, draft_id)
     if not task:
         raise LookupError("撰写任务不存在")
     if not task.draft_text:
         raise ValueError("尚未生成初稿")
-    if not (task.verification or {}).get("passed"):
+    verification = task.verification or {}
+    if not verification.get("passed"):
         raise ValueError("事实与引用校验未通过，请修订并重新校验后再导出")
+    pending = list(verification.get("pending_placeholders") or [])
+    if pending and _placeholder_gate_enabled(db, task):
+        raise ValueError(
+            "存在未补齐的占位符，请补齐后再导出：" + "、".join(pending[:5])
+        )
     document = WordDocument()
     normal = document.styles["Normal"]
     normal.font.name = "仿宋"

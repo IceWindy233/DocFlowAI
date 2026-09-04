@@ -37,12 +37,18 @@ def dashscope_workspace_rerank_base_url(workspace_id: str) -> str:
 
 class AdapterType(enum.StrEnum):
     DASHSCOPE_OPENAI = "dashscope_openai"
-    DEEPSEEK_OPENAI = "deepseek_openai"
+    OPENAI_COMPATIBLE = "openai_compatible"
     LOCAL_TRANSFORMERS = "local_transformers"
     RAPID_OCR = "rapidocr"
     TESSERACT = "tesseract"
     DOCLING = "docling"
     LIBREOFFICE = "libreoffice"
+
+
+# 需要密钥、走 HTTP 的适配器；本地适配器只做依赖探测，不受密钥与预算约束。
+CLOUD_OPENAI_ADAPTERS = frozenset(
+    {AdapterType.DASHSCOPE_OPENAI, AdapterType.OPENAI_COMPATIBLE}
+)
 
 
 class ModelCapability(enum.StrEnum):
@@ -85,6 +91,7 @@ class ModelProfileV1(BaseModel):
     model_signature: str = Field(min_length=1, max_length=240)
     price_input_per_million: float = Field(default=0.0, ge=0)
     price_output_per_million: float = Field(default=0.0, ge=0)
+    request_options: dict[str, bool | int | float | str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_capability_fields(self) -> ModelProfileV1:
@@ -106,11 +113,21 @@ class ModelProfileV1(BaseModel):
                     self.workspace_id = match.group("workspace_id")
         if self.capability == ModelCapability.TEXT_EMBEDDING and not self.embedding_dimension:
             raise ValueError("文本向量模型必须声明 embedding_dimension")
-        if self.adapter_type in {
-            AdapterType.DASHSCOPE_OPENAI,
-            AdapterType.DEEPSEEK_OPENAI,
-        } and not self.secret_env_name:
+        if self.adapter_type in CLOUD_OPENAI_ADAPTERS and not self.secret_env_name:
             raise ValueError("云端模型必须配置 secret_env_name")
+        protected_options = {
+            "model",
+            "messages",
+            "stream",
+            "response_format",
+            "temperature",
+            "max_tokens",
+        }
+        conflicts = protected_options.intersection(self.request_options)
+        if conflicts:
+            raise ValueError(
+                "请求扩展参数不能覆盖受保护字段: " + ", ".join(sorted(conflicts))
+            )
         if self.fallback_profile_id == self.profile_id:
             raise ValueError("模型不能将自身设为降级模型")
         return self
@@ -226,10 +243,83 @@ class SecurityConfig(BaseModel):
 
     bind_localhost_only: bool = True
     allowed_secret_env_names: list[EnvName] = Field(
-        default_factory=lambda: ["DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY"]
+        default_factory=lambda: ["DASHSCOPE_API_KEY", "CHAT_LLM_API_KEY"]
     )
     log_document_content: bool = False
     prompt_response_trace_enabled: bool = False
+
+
+class StyleMetric(enum.StrEnum):
+    """可从正文直接量出的文体特征，与 style_metrics.measure_style 的键一一对应。"""
+
+    CHARS = "chars"
+    SENTENCE_LENGTH = "sentence_length"
+    MAX_LINE_LENGTH = "max_line_length"
+    DUN_PER_MILLE = "dun_per_mille"
+    MANDATORY_WORDS = "mandatory_words"
+    REQUIREMENT_WORDS = "requirement_words"
+    SUGGESTION_WORDS = "suggestion_words"
+    PERCENT_VALUES = "percent_values"
+    DASHES = "dashes"
+    HEADING_LEVEL1 = "heading_level1"
+    HEADING_LEVEL2 = "heading_level2"
+    HEADING_LEVEL3 = "heading_level3"
+
+
+class StyleRange(BaseModel):
+    """语料实测的四分位区间；中位数用于展示，p25/p75 用于判定偏离方向。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    p25: float
+    median: float
+    p75: float
+
+    @model_validator(mode="after")
+    def validate_order(self) -> StyleRange:
+        if not self.p25 <= self.median <= self.p75:
+            raise ValueError("文体区间必须满足 p25 <= median <= p75")
+        return self
+
+
+class GenreStyleBaseline(BaseModel):
+    """单文种的文体基线，由本地语料离线统计得出，不随仓库分发。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_size: int = Field(ge=1)
+    source_label: str = Field(default="", max_length=200)
+    metrics: dict[StyleMetric, StyleRange] = Field(default_factory=dict)
+
+
+class WritingStyleConfig(BaseModel):
+    """撰写与审核共用的文体校准配置。
+
+    参数区间是描述性的：偏离只作提示，不作错误判定。硬门禁仅保留占位符一项，
+    因为未补齐的占位符是事实缺口，不是风格差异。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 键为 DraftRequirements.document_type（REQUEST / LETTER）。
+    baselines: dict[str, GenreStyleBaseline] = Field(default_factory=dict)
+    # 无基线可用时的长行提示阈值；有基线时改用该文种 max_line_length 的 p75。
+    long_line_fallback: int = Field(default=180, ge=40, le=2000)
+    max_dashes: int = Field(default=1, ge=0, le=20)
+    # 未补齐的占位符阻断导出，避免带着待核数字定稿。
+    placeholder_export_gate: bool = True
+    meta_comment_words: list[str] = Field(
+        default_factory=lambda: ["其实是", "其实就", "说到底", "归根到底", "本质上"]
+    )
+    bad_phrases: dict[str, str] = Field(
+        default_factory=lambda: {
+            "相关部门": "明确牵头单位和配合单位",
+            "尽快": "明确到具体年月日",
+            "高度重视": "直接陈述事实与办理请求",
+            "取得了显著成效": "写明具体成效",
+            "认真抓好": "写明责任单位和具体动作",
+        }
+    )
 
 
 class RuntimeConfigBundleV1(BaseModel):
@@ -247,6 +337,7 @@ class RuntimeConfigBundleV1(BaseModel):
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     publication: PublicationConfig = Field(default_factory=PublicationConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    writing_style: WritingStyleConfig = Field(default_factory=WritingStyleConfig)
     prompt_templates: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -415,18 +506,21 @@ def default_runtime_config() -> RuntimeConfigBundleV1:
                 timeout_seconds=60,
                 enabled=False,
             ),
+            # 出厂档案只是可直接跑通的示例：换供应商时改 Base URL、模型名和扩展参数即可，
+            # 网关不含任何供应商分支。
             ModelProfileV1(
-                profile_id="deepseek_v4_flash",
-                display_name="DeepSeek V4 Flash 问答生成",
-                provider_id="deepseek",
-                adapter_type=AdapterType.DEEPSEEK_OPENAI,
+                profile_id="cloud_chat_llm",
+                display_name="云端对话模型（OpenAI 兼容）",
+                provider_id="siliconflow",
+                adapter_type=AdapterType.OPENAI_COMPATIBLE,
                 capability=ModelCapability.CHAT_LLM,
-                model_name="deepseek-v4-flash",
-                base_url="https://api.deepseek.com",
-                secret_env_name="DEEPSEEK_API_KEY",
+                model_name="deepseek-ai/DeepSeek-V4-Flash",
+                base_url="https://api.siliconflow.cn/v1",
+                secret_env_name="CHAT_LLM_API_KEY",
                 temperature=0.1,
                 max_output_tokens=4096,
-                model_signature="deepseek:deepseek-v4-flash",
+                model_signature="siliconflow:deepseek-ai/DeepSeek-V4-Flash",
+                request_options={"enable_thinking": False},
                 enabled=False,
             ),
             ModelProfileV1(
