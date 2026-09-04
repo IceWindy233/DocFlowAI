@@ -56,9 +56,14 @@ DISPLAY_HEADING_PATTERN = re.compile(
     re.MULTILINE,
 )
 COMPLEX_STRUCTURE_PATTERNS = (
-    re.compile(r"包括[一二三四五六七八九十\d]+个?(?:子项|事项|任务|工程|方案)"),
-    re.compile(r"分[一二三四五六七八九十\d]+个?阶段"),
+    re.compile(
+        r"(?:包括|包含|涉及|分为)[一二三四五六七八九十\d]+个?(?:子项|事项|任务|工程|方案|部分)"
+    ),
+    re.compile(r"分[一二三四五六七八九十\d]+个?(?:阶段|批次|步骤)"),
     re.compile(r"一是[\s\S]{0,500}二是"),
+    re.compile(
+        r"(?:^|[\n；;])\s*(?:1|1[.、）)]|一[、是])[^\n]{2,200}(?:\n|[；;])\s*(?:2|2[.、）)]|二[、是])"
+    ),
 )
 
 
@@ -195,9 +200,18 @@ def _normalize_outline(value: Any, document_type: str) -> list[dict[str, str]]:
 
 
 def _requires_sectioned_presentation(requirements: DraftRequirements) -> bool:
-    """判断需求是否明确包含多个独立结构单元。"""
+    """判断是否存在值得显式分层的独立内容单元。
+
+    金额、期限、用途等同一审批事项的属性不单独触发分节；只有子项、
+    分阶段安排、多项独立决策或显著复杂的事实集才分层。
+    """
     content = f"{requirements.background}\n{requirements.facts}\n{requirements.requested_action}"
     if any(pattern.search(content) for pattern in COMPLEX_STRUCTURE_PATTERNS):
+        return True
+    if len(requirements.facts.strip()) >= 600:
+        return True
+    money_items = re.findall(r"\d+(?:\.\d+)?\s*(?:万|亿)?元", requirements.facts)
+    if len(money_items) >= 3 and re.search(r"(?:子项|分别|其中|各项)", requirements.facts):
         return True
     approval_verbs = re.findall(r"(?:同意|审议|批准|批复|核准)", requirements.requested_action)
     approval_parts = [
@@ -206,11 +220,68 @@ def _requires_sectioned_presentation(requirements: DraftRequirements) -> bool:
     return len(approval_verbs) >= 2 and len(approval_parts) >= 2
 
 
-def _resolve_presentation_mode(requirements: DraftRequirements, proposed_mode: str) -> str:
-    """用通用复杂度信号校正模型的呈现判断。"""
+def _resolve_presentation_mode(requirements: DraftRequirements, _proposed_mode: str) -> str:
+    """用可解释的复杂度信号决定呈现方式。"""
+    # 模型只规划内容顺序，不能把简单事项强制变成分节文。
     if _requires_sectioned_presentation(requirements):
         return "SECTIONED"
-    return "PARAGRAPH" if proposed_mode == "PARAGRAPH" else "SECTIONED"
+    return "PARAGRAPH"
+
+
+def _letter_intent(requirements: DraftRequirements) -> str:
+    """区分普通商请函与复函，用于选择文种承启句和结语。"""
+    subject = requirements.subject.strip()
+    context = f"{requirements.background}\n{requirements.requested_action}"
+    if re.match(r"^(?:关于)?(?:回复|答复|函复|复函)", subject) or re.search(
+        r"(?:来函|收悉|现函复|予以函复|答复如下)", context
+    ):
+        return "REPLY"
+    return "COORDINATION"
+
+
+def _drafting_brief(
+    requirements: DraftRequirements,
+    outline: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """把文种与结构决策显式交给生成节点，避免依赖模型猜测。"""
+    paragraph_mode = bool(outline) and all(item.get("render_heading") is False for item in outline)
+    common = {
+        "presentation_mode": "PARAGRAPH" if paragraph_mode else "SECTIONED",
+        "length_rule": "事项说完即止，不为满足模板而扩写",
+        "fact_rule": "只使用 requirements 中已确认事实，不从参考文移植事实",
+        "style_rule": "正式、准确、简洁；避免口语、空洞表态、同义反复和无依据定性",
+    }
+    if requirements.document_type == "REQUEST":
+        return {
+            **common,
+            "genre": "请示",
+            "title_pattern": "关于+事由+的请示，事由不重复‘关于’或‘的请示’",
+            "content_order": ["缘由或依据", "待审批方案与关键事实", "明确请示事项"],
+            "opening_rule": "直接交代为什么请示，不用‘高度重视’等空洞开场",
+            "closing": "妥否，请批示。",
+        }
+    if _letter_intent(requirements) == "REPLY":
+        return {
+            **common,
+            "genre": "复函",
+            "title_pattern": "关于+事由+的复函",
+            "content_order": ["交代来函收悉", "先明确答复结论", "必要的理由或安排"],
+            "opening_rule": (
+                "如 requirements 提供来函名称或文号，用‘…收悉。现函复如下’；未提供则不虚构"
+            ),
+            "closing": "特此函复。",
+        }
+    asks_for_reply = bool(
+        re.search(r"(?:请.*(?:回复|复函|反馈)|请予函复)", requirements.requested_action)
+    )
+    return {
+        **common,
+        "genre": "函",
+        "title_pattern": "关于+事由+的函",
+        "content_order": ["行函缘由", "需要协商或告知的事项", "对受文单位的明确请求"],
+        "opening_rule": "直接交代行函目的，不把函写成请示",
+        "closing": "专此函达，请予复函。" if asks_for_reply else "特此函达。",
+    }
 
 
 def _refine_outline_for_presentation(
@@ -439,14 +510,15 @@ def _generate_outline(
         "结构依据的优先级：①reference_structures 中与当前文种和主题最相近的正式公文一级标题；"
         "②requirements 的事项逻辑；③同类公文惯例。若高相关原文已有简洁且完整的骨架，"
         "优先保留其结构粒度和先后关系；不要为了显得完整而强行凑成4至5节。"
-        "短篇、单一请求的请示通常用2至3节即可，背景、必要性和基本情况可合并，"
+        "法定公文没有固定篇幅，事项说完即止。短篇、单一请求的请示应优先使用"
+        "连续自然段；内部提纲通常只保留2至3个内容单元，背景、必要性和基本情况可合并，"
         "方案金额、期限、用途、还款来源和担保方式等同一审批事项的属性应放在同一章节内，"
         "除非参考原文确有独立的一级结构。\n"
         "严格区分正文章节与公文组件：公文标题、主送机关、引言、结束语、附件、落款和日期都不是提纲章节。"
         "‘以上请示，妥否，请批示’、‘恳请批复’、‘特此函复’等只能作为结束语，"
         "绝对不得成为章节。避免‘申请事项’与‘请示事项’、‘有关情况’与‘基本情况’等语义重叠。"
         "请示如果设‘请示事项’，它应是最后一个实质章节。\n"
-        "另外判断正文呈现方式：单一审批事项、事实简洁、没有多个独立方案或数据分析时，"
+        "另外预判正文呈现方式：单一审批或单一商请事项、事实简洁、没有多个独立方案时，"
         "presentation_mode 应为 PARAGRAPH，最终正文使用连续自然段，提纲仅作内部逻辑规划；"
         "只有存在多个独立事项、复杂方案、分阶段安排、大量数据或政策论证时，才使用 SECTIONED。"
         "不得仅因参考文件有序号标题就选择 SECTIONED。\n"
@@ -495,9 +567,14 @@ def _generate_outline(
             None,
         )
     except CloudModelError as exc:
+        presentation_mode = _resolve_presentation_mode(requirements, "PARAGRAPH")
+        fallback_outline = _refine_outline_for_presentation(
+            _default_outline(requirements.document_type), presentation_mode, requirements
+        )
+        render_heading = presentation_mode == "SECTIONED"
         return (
-            _default_outline(requirements.document_type),
-            "local:outline-template-v1",
+            [{**item, "render_heading": render_heading} for item in fallback_outline],
+            "local:outline-template-v2",
             exc.usage,
             str(exc),
         )
@@ -700,22 +777,20 @@ def update_outline(
 
 
 def _fallback_draft(requirements: DraftRequirements, evidence: list[dict[str, Any]]) -> str:
+    del evidence  # 历史页默认仅是风格参考，降级稿不冒充事实引用。
     title = (
         f"关于{requirements.subject}的{'请示' if requirements.document_type == 'REQUEST' else '函'}"
     )
-    ending = (
-        "以上请示，妥否，请批示。"
-        if requirements.document_type == "REQUEST"
-        else "以上事项，函请贵单位研究支持。"
-    )
-    reference = " [1]" if evidence else ""
+    strategy = _drafting_brief(requirements, [])
+    if requirements.document_type == "LETTER" and strategy["genre"] == "复函":
+        title = f"关于{requirements.subject}的复函"
     parts = [
         title,
         f"{requirements.recipient}：",
-        f"{requirements.background}{reference}",
+        requirements.background,
         requirements.facts,
         requirements.requested_action,
-        ending,
+        str(strategy["closing"]),
         requirements.sender,
         requirements.date,
     ]
@@ -885,7 +960,12 @@ def generate_draft(
         "同一背景、问题或必要性；短篇请示应简洁，不为增加篇幅而同义反复。"
         "evidence 只包含未获事实授权的结构提示，不得据此增加任何当前事项事实。"
         "只有 requirements 明确提供了附件名称时才可输出附件段；不得因历史公文常带附件"
-        "就虚构‘项目实施方案’、‘预算明细表’等附件。"
+        "就虚构‘项目实施方案’、‘预算明细表’等附件。\n"
+        "必须严格执行 writing_brief：文种标题、内容顺序、承启方式和结语必须匹配。"
+        "简单请示以2至4个连续自然段说清缘由、方案事实和请示事项，不显示‘基本情况’"
+        "‘实施方案’‘请示事项’等模板标题。复函应先给出明确答复再说明理由；"
+        "普通函不得使用‘妥否，请批示’。语句应正式、准确、简洁，不使用‘尽快帮忙安排一下’"
+        "等口语，不以‘高度重视’等空洞表态开场，不用破折号制造节奏。"
     )
     regeneration_instruction = "首次生成完整初稿。"
     if task.draft_text and mode == "FULL":
@@ -979,6 +1059,7 @@ def generate_draft(
                     "existing_draft": task.draft_text,
                     "regeneration_instruction": regeneration_instruction,
                     "user_edit_instruction": instruction.strip() if instruction else None,
+                    "writing_brief": _drafting_brief(requirements, task.outline),
                 },
                 purpose="公文初稿生成",
             )
@@ -1032,7 +1113,8 @@ def generate_draft(
             "事实、无效引用和模型自行增加的现状或实施细节，同时补回 requirements 明确要求但"
             "遗漏的事实。只能使用 requirements 中的事实；evidence 默认仅用于结构措辞。不得"
             "增加新的金额、日期、设备、工程内容、单位、地点或判断，也不得保留仅来自样式参考"
-            "的事实。输出完整 JSON，字段"
+            "的事实。修复后仍须遵守 writing_brief 中的呈现方式、文种顺序和规范结语。"
+            "输出完整 JSON，字段"
             "draft_text、unverified_facts；修复后不应仍有无依据事实。"
         )
         try:
@@ -1045,6 +1127,7 @@ def generate_draft(
                     "draft_text": state["draft_text"],
                     "verification": state.get("verification") or {},
                     "evidence": _style_evidence_projection(task.evidence_bundle[:6]),
+                    "writing_brief": _drafting_brief(requirements, task.outline),
                 },
                 purpose="公文初稿约束修复",
             )

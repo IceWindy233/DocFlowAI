@@ -14,6 +14,7 @@ from docflow.domain.config import RuntimeConfigBundleV1
 from docflow.services.config_service import ensure_default_config
 from docflow.services.draft_agent import (
     _claim_supported_by_requirements,
+    _drafting_brief,
     _enforce_draft_presentation,
     _extract_outline_headings,
     _generate_outline,
@@ -185,6 +186,62 @@ def test_complex_multi_item_request_forces_sectioned_presentation() -> None:
         "实施计划",
         "请示事项",
     ]
+
+
+def test_simple_single_matter_request_stays_paragraph_even_if_model_proposes_sections() -> None:
+    requirements = DraftRequirements(
+        document_type="REQUEST",
+        subject="消防设施升级改造",
+        recipient="镇政府",
+        background="现有消防报警设备老化，部分区域无法实现集中监控。",
+        facts="更换控制器、增设烟感设备并完善联动系统；预算48万元；工期60天。",
+        requested_action="申请同意实施改造并按程序采购。",
+        sender="测试单位",
+    )
+    assert _resolve_presentation_mode(requirements, "SECTIONED") == "PARAGRAPH"
+
+
+def test_drafting_brief_uses_genre_specific_order_and_closing() -> None:
+    request = DraftRequirements(
+        document_type="REQUEST",
+        subject="申请流动资金贷款",
+        recipient="某银行",
+        background="为保障园区运营周转。",
+        facts="贷款500万元，期限12个月。",
+        requested_action="申请同意办理流动资金贷款。",
+        sender="测试单位",
+    )
+    brief = _drafting_brief(
+        request,
+        [{"id": "request", "title": "请示事项", "render_heading": False}],
+    )
+    assert brief["presentation_mode"] == "PARAGRAPH"
+    assert brief["content_order"][-1] == "明确请示事项"
+    assert brief["closing"] == "妥否，请批示。"
+
+    reply = request.model_copy(
+        update={
+            "document_type": "LETTER",
+            "subject": "回复征求意见函",
+            "background": "《征求意见函》收悉。",
+            "requested_action": "现就有关意见予以函复。",
+        }
+    )
+    reply_brief = _drafting_brief(reply, [])
+    assert reply_brief["genre"] == "复函"
+    assert reply_brief["content_order"][1] == "先明确答复结论"
+    assert reply_brief["closing"] == "特此函复。"
+
+    request_for_feedback = request.model_copy(
+        update={
+            "document_type": "LETTER",
+            "subject": "征求项目方案意见",
+            "requested_action": "请于五个工作日内反馈意见并予以复函。",
+        }
+    )
+    feedback_brief = _drafting_brief(request_for_feedback, [])
+    assert feedback_brief["genre"] == "函"
+    assert feedback_brief["closing"] == "专此函达，请予复函。"
 
 
 def test_draft_presentation_guard_removes_headings_and_unrequested_attachments() -> None:
