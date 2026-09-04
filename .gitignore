@@ -32,8 +32,7 @@ frontend/vite.config.js
 frontend/vite.config.d.ts
 
 # 原始语料、数据库、解析产物与模型缓存
-/corpus/letters/
-/corpus/requests/
+/corpus/
 /data/
 /backend/data/
 /models/
@@ -47,6 +46,7 @@ frontend/vite.config.d.ts
 /evaluation/fixed-agent-samples-v1.json
 /evaluation/fixed-agent-samples-expansion-v1.json
 
-# 个人材料与运行输出
-/面试参考.md
+# 本地笔记与运行输出
+/notes/
+*.local.md
 *.log
