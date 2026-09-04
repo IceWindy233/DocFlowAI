@@ -9,7 +9,7 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
-blocked_paths='(^|/)(\.env|data|backend/data|corpus/letters|corpus/requests)(/|$)|(^|/)面试参考\.md$'
+blocked_paths='(^|/)(\.env|data|backend/data|corpus|notes)(/|$)|\.local\.md$'
 if git ls-files | rg -n "$blocked_paths"; then
   echo "发现不应跟踪的本地数据路径。"
   exit 1
