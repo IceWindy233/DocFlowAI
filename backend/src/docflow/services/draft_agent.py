@@ -16,12 +16,14 @@ from sqlalchemy.orm import Session
 
 from docflow.db.models import ConfigVersion, DraftRevision, DraftTask, Page, WorkflowRun, utcnow
 from docflow.domain.agents import DraftRequirements
-from docflow.domain.config import RuntimeConfigBundleV1
+from docflow.domain.config import RuntimeConfigBundleV1, WritingStyleConfig
 from docflow.domain.retrieval import RetrievalSearchRequest
 from docflow.services.config_service import get_current_config
+from docflow.services.draft_conversation import interpret_requirement_patch
 from docflow.services.model_gateway import CloudModelError, generate_structured_content
 from docflow.services.retrieval import search
 from docflow.services.storage import LocalArtifactStore
+from docflow.services.style_metrics import BLOCKING_PLACEHOLDER_KINDS, style_report
 
 REQUIRED_FIELDS = {
     "REQUEST": {
@@ -50,6 +52,10 @@ HEADING_PREFIX_PATTERN = re.compile(
 )
 CLOSING_SECTION_PATTERN = re.compile(
     r"(?:以上.*(?:妥否|当否)|妥否.*批示|当否.*批示|恳请批复|请予批示|特此(?:请示|函达|函复)|此复)"
+)
+# 复函的表态词。批复类文种表态在最前，理由跟在表态之后。
+STANCE_PATTERN = re.compile(
+    r"原则同意|同意|不同意|予以支持|不予支持|无意见|可行|不宜|已办理|暂不"
 )
 DISPLAY_HEADING_PATTERN = re.compile(
     r"^\s*(?:[一二三四五六七八九十]{1,3}、|（[一二三四五六七八九十]{1,3}）|\d+[、.])\s*[^\n。；]{1,40}\s*$",
@@ -257,6 +263,13 @@ def _drafting_brief(
             "不用‘其实是’‘说到底’‘归根到底’等元评论，直接陈述事实、判断和办理请求",
             "没有提供真实文号、政策依据、领导批示或数据时不引用、不暗示、不补造",
         ],
+        "placeholder_rule": [
+            "requirements 未提供、但该文种必须出现的文号、日期、金额或单位，写成"
+            "‘【待补：xx】’占位，禁止杜撰，也不要绕开该要素",
+            "为帮助理解而给出的参考量级写成‘【示意·待核】’；引用上级文件表述拿不准时"
+            "写成‘【待核对原文】’",
+            "只用这三种占位写法；未提供的可省实施细节仍应直接省略，不要为它们加占位符",
+        ],
         "silent_self_check": [
             "标题、主送机关、行文方向和结语是否匹配文种",
             "是否完整保留用户确认的金额、日期、期限、单位和办理动作",
@@ -363,6 +376,17 @@ def _enforce_draft_presentation(
             "",
             value,
         )
+    lines = value.splitlines()
+    expected_recipient = f"{requirements.recipient.strip()}："
+    if requirements.recipient.strip() and not any(
+        line.strip() == expected_recipient for line in lines
+    ):
+        for index, line in enumerate(lines[:8]):
+            normalized = line.strip()
+            if index > 0 and len(normalized) <= 80 and normalized.endswith(("：", ":")):
+                lines[index] = expected_recipient
+                value = "\n".join(lines)
+                break
     return re.sub(r"\n{3,}", "\n\n", value).strip()
 
 
@@ -865,6 +889,8 @@ def _semantic_verify_draft(
         "数组）。‘影响正常运营’、‘影响形象’、‘存在重大风险’、‘亟需改造’等对当前"
         "现状、影响或紧迫性的判断也是事实主张，未在 requirements 提供时必须列为无依据。"
         "不要把纯结构、礼貌用语和不含现状判断的一般性目的表述列为事实。"
+        "‘【待补：…】’‘【示意·待核】’‘【待核对原文】’是显式声明的事实缺口标记，"
+        "本身不是事实主张，不列为无依据；但占位符之外被当成既定事实陈述的内容仍要核。"
     )
     try:
         checked = generate_structured_content(
@@ -938,11 +964,38 @@ def generate_draft(
         raise ValueError(f"需求不完整：{'、'.join(task.missing_fields)}")
     if task.status not in {"OUTLINE_APPROVED", "DRAFT_GENERATED", "DRAFT_EDITED", "EXPORTED"}:
         raise ValueError("请先确认提纲后再生成初稿")
-    requirements = DraftRequirements.model_validate(task.requirements)
     pinned_config = db.get(ConfigVersion, task.config_version_id)
     if not pinned_config:
         raise LookupError("撰写任务绑定的配置版本不存在")
     config = RuntimeConfigBundleV1.model_validate(pinned_config.content)
+    requirements = DraftRequirements.model_validate(task.requirements)
+    requirement_edit: dict[str, Any] = {}
+    requirement_edit_usage: dict[str, Any] = {}
+    requirement_edit_warning: str | None = None
+    requirement_edit_duration_ms = 0
+    if task.draft_text and instruction and instruction.strip():
+        requirement_edit_started = time.perf_counter()
+        interpreted = interpret_requirement_patch(
+            config,
+            message=instruction.strip(),
+            current_requirements=requirements.model_dump(),
+        )
+        requirement_edit_duration_ms = round(
+            (time.perf_counter() - requirement_edit_started) * 1000
+        )
+        requirement_edit = dict(interpreted.get("requirements_patch") or {})
+        requirement_edit_usage = dict(interpreted.get("cloud_usage") or {})
+        requirement_edit_warning = interpreted.get("warning")
+        if requirement_edit:
+            merged_requirements = requirements.model_dump()
+            merged_requirements.update(requirement_edit)
+            requirements = DraftRequirements.model_validate(merged_requirements)
+            task.requirements = requirements.model_dump()
+            task.document_type = requirements.document_type
+            task.title = requirements.subject
+            task.missing_fields = _missing(requirements)
+            if task.missing_fields:
+                raise ValueError(f"修改后的需求不完整：{'、'.join(task.missing_fields)}")
     run = WorkflowRun(
         workflow_type="DOCUMENT_DRAFT_GENERATION",
         status="RUNNING",
@@ -952,6 +1005,7 @@ def generate_draft(
             "outline": task.outline,
             "mode": mode,
             "instruction": instruction.strip() if instruction else None,
+            "requirements_patch": requirement_edit,
         },
         state_json={},
         trace_json=[],
@@ -966,7 +1020,9 @@ def generate_draft(
         "事实；历史材料仅用于结构和措辞参考，不得把其中的金额、日期、单位移植为当前事实。"
         "不得自行增加现状判断、改造项目、金额、日期、单位或实施依据，也不得把用户表达的目标"
         "改写成‘目前存在问题’等未经证实的现状结论；未提供的实施细节应直接"
-        "省略，不要为了充实正文而猜测。unverified_facts 只能列出确实写入 draft_text 且没有"
+        "省略，不要为了充实正文而猜测。该文种必须出现而 requirements 未提供的文号、日期、"
+        "金额或单位，按 writing_brief.placeholder_rule 占位，不得杜撰。"
+        "unverified_facts 只能列出确实写入 draft_text 且没有"
         "依据的原文片段，不得把 requirements 已提供的事实列入其中。输出 JSON 对象，字段 "
         "draft_text、"
         "used_evidence_ids、unverified_facts。正文须包含标题、主送单位、按提纲组织的正文、规范结束语、"
@@ -999,10 +1055,26 @@ def generate_draft(
         )
     if instruction and instruction.strip():
         regeneration_instruction += (
-            " 用户还提出了以下本轮编辑要求，请尽量只修改与要求相关的内容，"
+            " 用户还提出了以下本轮编辑要求。requirements 已合并本轮明确修改，是当前唯一权威"
+            "事实；必须替换 existing_draft 中与新 requirements 冲突的旧值，只修改相关内容并"
             "保留其他已确认事实和正文结构：" + instruction.strip()
         )
     trace: list[dict[str, Any]] = []
+    if instruction and instruction.strip():
+        trace.append(
+            {
+                "sequence": 1,
+                "node": "requirement_editor",
+                "label": "编辑要求理解",
+                "status": "DEGRADED" if requirement_edit_warning else "SUCCEEDED",
+                "duration_ms": requirement_edit_duration_ms,
+                "summary": (
+                    f"更新 {len(requirement_edit)} 个需求字段"
+                    if requirement_edit
+                    else ("需求理解降级" if requirement_edit_warning else "未涉及事实字段")
+                ),
+            }
+        )
     labels = {
         "draft_composer": "公文初稿生成",
         "fact_verifier": "事实与引用校验",
@@ -1119,7 +1191,10 @@ def generate_draft(
         semantic_warning = semantic_warning or state.get("warning")
         return {
             "verification": verify_draft_content(
-                task, _deduplicate_unverified(semantic_unverified), semantic_warning
+                task,
+                _deduplicate_unverified(semantic_unverified),
+                semantic_warning,
+                style=config.writing_style,
             ),
             "verification_usage": semantic_usage,
             "repair_attempted": False,
@@ -1132,6 +1207,8 @@ def generate_draft(
             "遗漏的事实。只能使用 requirements 中的事实；evidence 默认仅用于结构措辞。不得"
             "增加新的金额、日期、设备、工程内容、单位、地点或判断，也不得保留仅来自样式参考"
             "的事实。修复后仍须遵守 writing_brief 中的呈现方式、文种顺序和规范结语。"
+            "draft_text 中已有的‘【待补：…】’‘【示意·待核】’‘【待核对原文】’必须原样保留，"
+            "不得替换成具体数值，也不得删掉整句改成回避表述。"
             "输出完整 JSON，字段"
             "draft_text、unverified_facts；修复后不应仍有无依据事实。"
         )
@@ -1211,11 +1288,14 @@ def generate_draft(
         task.model_signature = state["model_signature"]
         task.cloud_usage = _usage_add(
             task.cloud_usage or {},
+            requirement_edit_usage,
             state.get("generation_usage") or {},
             state.get("verification_usage") or {},
         )
         run_usage = _usage_add(
-            state.get("generation_usage") or {}, state.get("verification_usage") or {}
+            requirement_edit_usage,
+            state.get("generation_usage") or {},
+            state.get("verification_usage") or {},
         )
         task.verification = {
             **state["verification"],
@@ -1257,8 +1337,30 @@ def generate_draft(
         raise
 
 
+def _body_after_recipient(text: str) -> str:
+    """跳过标题与主送机关行，只保留实质正文，用于表态位置判断。"""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().endswith(("：", ":")):
+            return "\n".join(lines[index + 1 :])
+    return "\n".join(lines[1:]) if len(lines) > 1 else text
+
+
+def _stance_position(text: str) -> dict[str, Any]:
+    """复函先表态后说理：返回表态词在实质正文中的相对位置。"""
+    body = _body_after_recipient(text).strip()
+    match = STANCE_PATTERN.search(body)
+    if not body or not match:
+        return {"found": False, "ratio": None, "leading": False}
+    ratio = round(match.start() / len(body), 2)
+    return {"found": True, "ratio": ratio, "leading": ratio <= 0.5}
+
+
 def verify_draft_content(
-    task: DraftTask, unverified: list[Any] | None = None, warning: str | None = None
+    task: DraftTask,
+    unverified: list[Any] | None = None,
+    warning: str | None = None,
+    style: WritingStyleConfig | None = None,
 ) -> dict[str, Any]:
     requirements = DraftRequirements.model_validate(task.requirements)
     text = task.draft_text
@@ -1270,14 +1372,53 @@ def verify_draft_content(
     inline_ids = {int(value) for value in re.findall(r"\[(?:证据)?(\d+)\]", text)}
     valid_ids = {int(item["id"]) for item in task.evidence_bundle if item.get("id")}
     invalid_ids = sorted(inline_ids - valid_ids)
+    required_field_patterns = (
+        (
+            "主送单位",
+            requirements.recipient,
+            rf"(?m)^\s*{re.escape(requirements.recipient.strip())}\s*[：:]\s*$",
+        ),
+        (
+            "发文单位",
+            requirements.sender,
+            rf"(?m)^\s*{re.escape(requirements.sender.strip())}\s*$",
+        ),
+    )
+    missing_required_fields = [
+        label
+        for label, value, pattern in required_field_patterns
+        if value.strip() and re.search(pattern, text) is None
+    ]
+    style_config = style or WritingStyleConfig()
+    report = style_report(
+        text,
+        style_config.baselines.get(requirements.document_type),
+        bad_phrases=style_config.bad_phrases,
+        meta_comment_words=style_config.meta_comment_words,
+    )
+    if _letter_intent(requirements) == "REPLY":
+        report["stance_position"] = _stance_position(text)
+    placeholders = report.get("placeholders") or {}
+    pending_placeholders = [
+        value for kind in BLOCKING_PLACEHOLDER_KINDS for value in placeholders.get(kind, [])
+    ]
     return {
-        "passed": not missing_facts and not invalid_ids and not (unverified or []),
+        # 文体偏离不进 passed：区间是描述性的，多项同向偏离才说明节奏不对。
+        "passed": (
+            not missing_facts
+            and not invalid_ids
+            and not missing_required_fields
+            and not (unverified or [])
+        ),
         "missing_required_facts": missing_facts,
+        "missing_required_fields": missing_required_fields,
         "invalid_citation_ids": invalid_ids,
         "unverified_facts": unverified or [],
         "warning": warning,
         "fact_count": len(facts),
         "citation_count": len(inline_ids),
+        "pending_placeholders": pending_placeholders,
+        "style_report": report,
     }
 
 
@@ -1307,7 +1448,9 @@ def update_draft_text(db: Session, draft_id: str, text: str) -> dict[str, Any]:
         config, requirements, text, task.evidence_bundle
     )
     task.draft_text = text
-    task.verification = verify_draft_content(task, unsupported, warning)
+    task.verification = verify_draft_content(
+        task, unsupported, warning, style=config.writing_style
+    )
     task.status = "DRAFT_EDITED"
     task.export_path = None
     task.finished_at = None
@@ -1446,14 +1589,29 @@ def _normalized_task_evidence(task: DraftTask) -> list[dict[str, Any]]:
     return values[:8]
 
 
+def _placeholder_gate_enabled(db: Session, task: DraftTask) -> bool:
+    """占位符门禁读任务绑定的配置版本，保证历史任务按当时口径导出。"""
+    pinned = db.get(ConfigVersion, task.config_version_id)
+    if not pinned:
+        return True
+    config = RuntimeConfigBundleV1.model_validate(pinned.content)
+    return config.writing_style.placeholder_export_gate
+
+
 def export_draft(db: Session, draft_id: str) -> str:
     task = db.get(DraftTask, draft_id)
     if not task:
         raise LookupError("撰写任务不存在")
     if not task.draft_text:
         raise ValueError("尚未生成初稿")
-    if not (task.verification or {}).get("passed"):
+    verification = task.verification or {}
+    if not verification.get("passed"):
         raise ValueError("事实与引用校验未通过，请修订并重新校验后再导出")
+    pending = list(verification.get("pending_placeholders") or [])
+    if pending and _placeholder_gate_enabled(db, task):
+        raise ValueError(
+            "存在未补齐的占位符，请补齐后再导出：" + "、".join(pending[:5])
+        )
     document = WordDocument()
     normal = document.styles["Normal"]
     normal.font.name = "仿宋"

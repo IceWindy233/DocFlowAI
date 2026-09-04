@@ -341,6 +341,47 @@ def rerank_documents(
         raise CloudModelError(str(redact(str(exc)))[:500], usage) from exc
 
 
+def _chat_completion(
+    profile: ModelProfileV1,
+    messages: list[dict[str, Any]],
+) -> tuple[str, dict[str, int]]:
+    """Single OpenAI-compatible chat entrypoint; provider quirks belong to request_options."""
+    request: dict[str, Any] = {
+        "model": profile.model_name,
+        "temperature": profile.temperature,
+        "max_tokens": profile.max_output_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": messages,
+    }
+    request.update(profile.request_options)
+    with httpx.Client(timeout=profile.timeout_seconds) as client:
+        response = client.post(
+            f"{profile.base_url.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {os.environ[profile.secret_env_name]}",
+                "Content-Type": "application/json",
+            },
+            json=request,
+        )
+        response.raise_for_status()
+        body = response.json()
+    raw_usage = body.get("usage") or {}
+    usage = {
+        "calls": 1,
+        "input_tokens": int(raw_usage.get("prompt_tokens", 0)),
+        "output_tokens": int(raw_usage.get("completion_tokens", 0)),
+    }
+    usage["estimated_cost_cny"] = round(
+        (
+            usage["input_tokens"] * profile.price_input_per_million
+            + usage["output_tokens"] * profile.price_output_per_million
+        )
+        / 1_000_000,
+        6,
+    )
+    return body["choices"][0]["message"]["content"], usage
+
+
 def generate_structured_content(
     config: RuntimeConfigBundleV1,
     *,
@@ -354,46 +395,16 @@ def generate_structured_content(
         config.routing.qa_generation_primary,
         purpose,
     )
-    request: dict[str, Any] = {
-        "model": profile.model_name,
-        "temperature": profile.temperature,
-        "max_tokens": profile.max_output_tokens,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-    }
-    if profile.adapter_type.value == "deepseek_openai":
-        request["thinking"] = {"type": "disabled"}
     usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
     try:
-        with httpx.Client(timeout=profile.timeout_seconds) as client:
-            response = client.post(
-                f"{profile.base_url.rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {os.environ[profile.secret_env_name]}",
-                    "Content-Type": "application/json",
-                },
-                json=request,
-            )
-            response.raise_for_status()
-            body = response.json()
-        raw_usage = body.get("usage") or {}
-        usage = {
-            "calls": 1,
-            "input_tokens": int(raw_usage.get("prompt_tokens", 0)),
-            "output_tokens": int(raw_usage.get("completion_tokens", 0)),
-        }
-        usage["estimated_cost_cny"] = round(
-            (
-                usage["input_tokens"] * profile.price_input_per_million
-                + usage["output_tokens"] * profile.price_output_per_million
-            )
-            / 1_000_000,
-            6,
+        raw_content, usage = _chat_completion(
+            profile,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
         )
-        content = json.loads(body["choices"][0]["message"]["content"])
+        content = json.loads(raw_content)
         if not isinstance(content, dict):
             raise CloudModelError(f"{purpose}模型未返回 JSON 对象", usage)
         return StructuredGenerationResult(content, profile.model_signature, usage)
@@ -438,45 +449,22 @@ def generate_chat_answer(
         "出现对应的 [ID]。"
         "confidence 必须是 0 到 1 的数字。"
     )
-    payload: dict[str, Any] = {
-        "model": profile.model_name,
-        "temperature": profile.temperature,
-        "max_tokens": profile.max_output_tokens,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"question": question, "evidence": evidence},
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-    }
-    if profile.adapter_type.value == "deepseek_openai":
-        payload["thinking"] = {"type": "disabled"}
     usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
     try:
-        with httpx.Client(timeout=profile.timeout_seconds) as client:
-            response = client.post(
-                f"{profile.base_url.rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {os.environ[profile.secret_env_name]}",
-                    "Content-Type": "application/json",
+        raw_content, usage = _chat_completion(
+            profile,
+            [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"question": question, "evidence": evidence},
+                        ensure_ascii=False,
+                    ),
                 },
-                json=payload,
-            )
-            response.raise_for_status()
-            body = response.json()
-        raw_usage = body.get("usage") or {}
-        usage = {
-            "calls": 1,
-            "input_tokens": int(raw_usage.get("prompt_tokens", 0)),
-            "output_tokens": int(raw_usage.get("completion_tokens", 0)),
-        }
-        content = body["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
+            ],
+        )
+        parsed = json.loads(raw_content)
         answer = str(parsed.get("answer") or "").strip()
         if not answer:
             raise CloudModelError("问答模型返回了空答案", usage)

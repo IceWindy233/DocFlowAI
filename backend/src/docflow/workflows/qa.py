@@ -528,7 +528,7 @@ def run_qa_workflow(db: Session, request: RetrievalAnswerRequest) -> dict[str, A
                 return {
                     **generated,
                     "generation_model_signature": "local:extractive-v1",
-                    "generation_warning": f"DeepSeek 暂时不可用，已降级为本地抽取：{exc}",
+                    "generation_warning": f"云端对话模型暂时不可用，已降级为本地抽取：{exc}",
                     "cloud_usage": usage,
                 }
         generated = generate_extractive_answer(

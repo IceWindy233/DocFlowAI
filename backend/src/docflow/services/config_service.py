@@ -17,6 +17,7 @@ from docflow.core.logging import redact
 from docflow.core.settings import get_settings
 from docflow.db.models import AuditEvent, ConfigVersion, IngestionJob, ModelProbe, new_id
 from docflow.domain.config import (
+    CLOUD_OPENAI_ADAPTERS,
     AdapterType,
     ChangeImpact,
     ConfigImpactResponse,
@@ -253,6 +254,7 @@ def model_profile_probe_fingerprint(profile: ModelProfileV1) -> str:
         "secret_env_name",
         "embedding_dimension",
         "model_signature",
+        "request_options",
     }
     payload = profile.model_dump(mode="json", include=fields)
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -338,10 +340,7 @@ def _require_cloud_defaults_ready(db: Session, config: RuntimeConfigBundleV1) ->
     } - {None}
     for profile_id in routed_ids:
         profile = profiles[profile_id]
-        if profile.adapter_type not in {
-            AdapterType.DASHSCOPE_OPENAI,
-            AdapterType.DEEPSEEK_OPENAI,
-        }:
+        if profile.adapter_type not in CLOUD_OPENAI_ADAPTERS:
             continue
         env_name = profile.secret_env_name
         if not env_name or env_name not in config.security.allowed_secret_env_names:
@@ -494,10 +493,7 @@ def probe_model(
     profile = profile_override or get_profile(config, profile_id)
     if profile.profile_id != profile_id:
         raise ModelNotReadyError("探测模型 ID 与请求路径不一致")
-    if profile.adapter_type not in {
-        AdapterType.DASHSCOPE_OPENAI,
-        AdapterType.DEEPSEEK_OPENAI,
-    }:
+    if profile.adapter_type not in CLOUD_OPENAI_ADAPTERS:
         result = _local_probe(profile)
     else:
         start = time.monotonic()
@@ -571,8 +567,7 @@ def probe_model(
                             "temperature": 0,
                             "max_tokens": 8,
                         }
-                        if profile.adapter_type == AdapterType.DEEPSEEK_OPENAI:
-                            payload["thinking"] = {"type": "disabled"}
+                        payload.update(profile.request_options)
                         response = client.post(
                             f"{profile.base_url.rstrip('/')}/chat/completions",
                             headers=headers,

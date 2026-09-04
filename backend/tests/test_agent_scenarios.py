@@ -284,8 +284,14 @@ def test_scenario_09_invalid_citation_is_detected(db: Session) -> None:
 
 
 def test_scenario_10_local_fallback_warning_blocks_export(db: Session) -> None:
-    task = _task(db, "项目预算5万元，计划于2026年9月30日前完成。[1]")
-    result = verify_draft_content(task, warning="DeepSeek 不可用，已使用本地模板")
+    task = _task(
+        db,
+        "关于停车场升级改造的请示\n\n"
+        "镇人民政府：\n\n"
+        "项目预算5万元，计划于2026年9月30日前完成。[1]\n\n"
+        "测试单位\n2026年8月13日",
+    )
+    result = verify_draft_content(task, warning="云端对话模型不可用，已使用本地模板")
     # 降级内容仍可校验，但必须显式保留降级说明，交由页面展示。
-    assert result["warning"] == "DeepSeek 不可用，已使用本地模板"
+    assert result["warning"] == "云端对话模型不可用，已使用本地模板"
     assert result["passed"] is True

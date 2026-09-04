@@ -136,13 +136,13 @@ def test_fact_aliases_and_reordered_parentheses_are_equivalent() -> None:
 def test_full_evaluation_marks_incomplete_cloud_pricing() -> None:
     config = default_runtime_config().model_copy(deep=True)
     config.routing.text_embedding_primary = "bailian_embedding"
-    config.routing.qa_generation_primary = "deepseek_v4_flash"
+    config.routing.qa_generation_primary = "cloud_chat_llm"
     assert _pricing_configured(config, "FULL_QA") is False
     assert _pricing_configured(config, "LOCAL_RETRIEVAL") is True
 
     profiles = {profile.profile_id: profile for profile in config.models}
-    profiles["deepseek_v4_flash"].price_input_per_million = 1
-    profiles["deepseek_v4_flash"].price_output_per_million = 2
+    profiles["cloud_chat_llm"].price_input_per_million = 1
+    profiles["cloud_chat_llm"].price_output_per_million = 2
     assert _pricing_configured(config, "FULL_QA") is True
 
 

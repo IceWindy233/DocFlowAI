@@ -31,6 +31,7 @@ export interface ModelProfile {
   model_signature: string
   price_input_per_million: number
   price_output_per_million: number
+  request_options: Record<string, boolean | number | string>
 }
 
 export interface RuntimeConfig {
@@ -551,7 +552,7 @@ export interface DraftTask {
   evidence_bundle: { id: number; case_id: string; document_id: string; page_id: string; title: string; document_number: string | null; page_number: number; snippet: string; preview_url: string | null; evidence_type: 'FACT_EVIDENCE' | 'STYLE_REFERENCE'; relevance_score: number; selection_reason: string }[]
   outline: { id: string; title: string; render_heading?: boolean }[]
   draft_text: string
-  verification: { passed?: boolean; missing_required_facts?: string[]; invalid_citation_ids?: number[]; unverified_facts?: string[]; warning?: string | null; fact_count?: number; citation_count?: number }
+  verification: { passed?: boolean; missing_required_facts?: string[]; missing_required_fields?: string[]; invalid_citation_ids?: number[]; unverified_facts?: string[]; warning?: string | null; fact_count?: number; citation_count?: number }
   export_url: string | null
   config_version_id: string
   workflow_run_id: string | null

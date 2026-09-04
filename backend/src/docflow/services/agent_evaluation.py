@@ -21,7 +21,11 @@ from docflow.db.models import (
 )
 from docflow.domain.agent_evaluation import AgentEvaluationRunRequest
 from docflow.domain.agents import DocumentReviewCreate, DraftRequirements
-from docflow.domain.config import AdapterType, ModelCapability, RuntimeConfigBundleV1
+from docflow.domain.config import (
+    CLOUD_OPENAI_ADAPTERS,
+    ModelCapability,
+    RuntimeConfigBundleV1,
+)
 from docflow.domain.retrieval import RetrievalAnswerRequest
 from docflow.services.config_service import get_current_config
 from docflow.services.draft_agent import (
@@ -111,13 +115,12 @@ def _pricing_configured(config: RuntimeConfigBundleV1, mode: str) -> bool:
         config.routing.reranker_primary,
         config.routing.qa_generation_primary,
     )
-    cloud_adapters = {AdapterType.DASHSCOPE_OPENAI, AdapterType.DEEPSEEK_OPENAI}
     routed_cloud_profiles = [
         profiles[profile_id]
         for profile_id in route_ids
         if profile_id
         and profile_id in profiles
-        and profiles[profile_id].adapter_type in cloud_adapters
+        and profiles[profile_id].adapter_type in CLOUD_OPENAI_ADAPTERS
     ]
     if not routed_cloud_profiles:
         return False
@@ -512,8 +515,13 @@ def _review_result(
     db: Session, sample: dict[str, Any], mode: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if mode == "LOCAL_RULES":
+        # 本地评测也走当前文体配置，否则规则集与线上审核不同源。
+        config = RuntimeConfigBundleV1.model_validate(get_current_config(db).content)
         findings = deterministic_review(
-            sample["text"], sample["title"], sample["scope"]
+            sample["text"],
+            sample["title"],
+            sample["scope"],
+            style=config.writing_style,
         )
         return _review_score(sample, findings), {}
     review = create_review(
