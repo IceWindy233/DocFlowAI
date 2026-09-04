@@ -218,6 +218,9 @@ def test_drafting_brief_uses_genre_specific_order_and_closing() -> None:
     assert brief["presentation_mode"] == "PARAGRAPH"
     assert brief["content_order"][-1] == "明确请示事项"
     assert brief["closing"] == "妥否，请批示。"
+    assert len(brief["style_guide"]) >= 5
+    assert any("力度词" in rule for rule in brief["style_guide"])
+    assert any("文种" in rule for rule in brief["silent_self_check"])
 
     reply = request.model_copy(
         update={

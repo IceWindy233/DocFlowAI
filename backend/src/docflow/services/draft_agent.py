@@ -249,7 +249,19 @@ def _drafting_brief(
         "presentation_mode": "PARAGRAPH" if paragraph_mode else "SECTIONED",
         "length_rule": "事项说完即止，不为满足模板而扩写",
         "fact_rule": "只使用 requirements 中已确认事实，不从参考文移植事实",
-        "style_rule": "正式、准确、简洁；避免口语、空洞表态、同义反复和无依据定性",
+        "style_guide": [
+            "篇名直接说明事由和文种，不加叙事钩子、比喻或宣传性前缀",
+            "每句有明确主体和动作；同一逻辑内可适度合并并列成分，但不机械拉长句子",
+            "‘必须’‘应当’‘切实’‘确保’只在事实、制度或职责确有要求时使用，不堆叠力度词",
+            "标点只服务于语法和层次；正文不用破折号制造节奏，不用冒号制造悬念或媒体化揭晓",
+            "不用‘其实是’‘说到底’‘归根到底’等元评论，直接陈述事实、判断和办理请求",
+            "没有提供真实文号、政策依据、领导批示或数据时不引用、不暗示、不补造",
+        ],
+        "silent_self_check": [
+            "标题、主送机关、行文方向和结语是否匹配文种",
+            "是否完整保留用户确认的金额、日期、期限、单位和办理动作",
+            "是否出现无依据事实、重复表述、空洞表态、口语或不必要分层",
+        ],
     }
     if requirements.document_type == "REQUEST":
         return {
@@ -258,6 +270,7 @@ def _drafting_brief(
             "title_pattern": "关于+事由+的请示，事由不重复‘关于’或‘的请示’",
             "content_order": ["缘由或依据", "待审批方案与关键事实", "明确请示事项"],
             "opening_rule": "直接交代为什么请示，不用‘高度重视’等空洞开场",
+            "stance_rule": "如实陈述并请求上级审定，不预设已获批准，不以命令口吻要求主送机关",
             "closing": "妥否，请批示。",
         }
     if _letter_intent(requirements) == "REPLY":
@@ -269,6 +282,7 @@ def _drafting_brief(
             "opening_rule": (
                 "如 requirements 提供来函名称或文号，用‘…收悉。现函复如下’；未提供则不虚构"
             ),
+            "stance_rule": "答复意见或处理结论置于前部，不先铺陈大段背景后才表态",
             "closing": "特此函复。",
         }
     asks_for_reply = bool(
@@ -280,6 +294,7 @@ def _drafting_brief(
         "title_pattern": "关于+事由+的函",
         "content_order": ["行函缘由", "需要协商或告知的事项", "对受文单位的明确请求"],
         "opening_rule": "直接交代行函目的，不把函写成请示",
+        "stance_rule": "对不相隶属单位使用商请或告知语气，不使用上下级命令口吻",
         "closing": "专此函达，请予复函。" if asks_for_reply else "特此函达。",
     }
 
@@ -531,6 +546,7 @@ def _generate_outline(
         "输出 JSON 对象，仅含 presentation_mode 和 outline；"
         "presentation_mode 只能是 PARAGRAPH 或 SECTIONED；outline 每项仅含 id 和 title。"
         "title 使用2至12个字的规范中文标题，不带‘一、’等序号，不写该节正文；"
+        "同一篇的标题应保持相同语法层级，直接概括该部分功能，不使用比喻、口号或媒体化设问。"
         "请示最多5节，函最多4节。只依据 requirements 规划，不补充未知事实。"
     )
     reference_structures = _reference_outline_structures(db, cases)
@@ -966,6 +982,8 @@ def generate_draft(
         "‘实施方案’‘请示事项’等模板标题。复函应先给出明确答复再说明理由；"
         "普通函不得使用‘妥否，请批示’。语句应正式、准确、简洁，不使用‘尽快帮忙安排一下’"
         "等口语，不以‘高度重视’等空洞表态开场，不用破折号制造节奏。"
+        "生成前按 writing_brief.silent_self_check 在内部检查，不向 draft_text 输出检查过程、"
+        "说明、参数报告或写作建议。"
     )
     regeneration_instruction = "首次生成完整初稿。"
     if task.draft_text and mode == "FULL":
